@@ -268,6 +268,15 @@ routine to run at all is most of the work. In rough order of preference:
   reaches a screen on one run and misses on the next. Trigger on a code offset
   ("press F1 when execution reaches the menu's key read"), or on the guest
   having drained the keyboard buffer and come back for more.
+- **Or ask the machine, over the control socket.** `--control-socket PATH`
+  answers one-line commands while the guest runs: `status` says which video
+  mode it is in and where CS:IP is, `key space` presses a key, `snap` asks for
+  a capture, `break i+0x1c3f` stops at a routine, and `regs`, `read`, `stack`
+  and `disasm` say why. A driver that *looks* before it presses — "is it on
+  the title yet?" — reaches the same screen every run, and the same socket is
+  how a test reaches a state a snapshot was taken just short of. Subclass
+  `Control` in the project to put its routine and variable names on the
+  addresses.
 
 ## Timing
 
@@ -301,6 +310,17 @@ which makes the game's speed a property of the machine rather than of the game.
   the time the divergence was already there and belongs to someone else.
 - **Know your file formats.** `--shot` writing BMP while named `.png` wastes a
   cycle; so does assuming a scan code is decimal when it is parsed as hex.
+- **A frame count is not a guest state.** "Snapshot at display frame 900"
+  worked in a window and never fired headless, because the display loop ran at
+  a different rate and the guest's own page flips did not care. A frame number
+  is a wall clock in disguise; capture on the guest's cue — a socket `snap`
+  once `status` shows the mode you wanted, or a breakpoint — and it happens on
+  every machine.
+- **`--verify` from a cold start measures the loader.** Comparing every native
+  against the original from the program's entry point spends its first minutes
+  checking one-byte config reads thousands of times and never reaches the
+  screen anyone wanted checked. Reach the state plainly, capture it, and verify
+  from the capture.
 
 ## What goes where
 
@@ -376,7 +396,8 @@ file.
 - the CPU wrapper, and executable recovery (EXEPACK, LZEXE, PKLITE)
 - video: CGA/EGA/VGA modes, palettes, retrace, the text-mode renderer and its
   code-page tables
-- input, timing, the machine snapshot format, the deterministic key driver
+- input, timing, the machine snapshot format, the deterministic key driver,
+  the control socket and its debugger verbs
 - the cycle-cost model, the disassembly and code-mapping helpers, the
   differential-verify scaffolding
 

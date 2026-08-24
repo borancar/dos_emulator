@@ -53,7 +53,11 @@ dependencies = [
   on 0x3da
 - a *hardware* keyboard — programs that install their own INT 09h and read scan
   codes off port 0x60 work, not only those that call the BIOS
+- **VGA** mode 13h, and Mode X when the program turns chain-4 off: the
+  sequencer's map mask, the CRTC start address and offset, and the DAC
 - a mouse, a PC speaker, and optional Sound Blaster and XMS
+- a control socket into the running machine: keys, captures, breakpoints,
+  memory, a disassembly
 
 ## The read-only guarantee
 
@@ -93,7 +97,24 @@ uv run dos-emulator GAME.EXE --cmdline LEVELS
 with what the guest is doing — so a script tuned on one run can miss on the
 next. For a program that sits waiting for input, drive it from a cue the guest
 gives instead: that it has drained the keyboard buffer and come back for more,
-or that execution reached a particular code offset.
+or that execution reached a particular code offset (`@1c3f:f1`).
+
+Or ask the machine. `--control-socket PATH` opens a Unix socket that answers
+one-line commands while the program runs, so a driver can *look* before it
+presses:
+
+```sh
+uv run dos-emulator GAME.EXE --control-socket /tmp/game.sock &
+printf 'status\n'        | nc -U /tmp/game.sock   # frame, video mode, CS:IP
+printf 'key space\n'     | nc -U /tmp/game.sock   # once it is on the title
+printf 'break i+0x1c3f\n' | nc -U /tmp/game.sock   # stop at a routine
+printf 'regs\n'          | nc -U /tmp/game.sock
+```
+
+The same socket is a debugger — breakpoints, `step`, `until`, `finish`, a
+stack walk, memory reads and pokes, a disassembly — and a project puts its own
+names on the addresses by subclassing `Control`. `src/dos_emulator/control.py`
+documents the verbs.
 
 ## Layering, and where changes go
 
@@ -120,6 +141,7 @@ before pushing.
 | `src/dos_emulator/emulator.py` | the machine, the DOS/BIOS shim, the video and input layers, and the CLI |
 | `src/dos_emulator/sb.py` | a Sound Blaster model — DSP commands, the mixer, DMA playback |
 | `src/dos_emulator/xms.py` | an XMS driver: the `INT 2Fh` hook, handles, and block moves |
+| `src/dos_emulator/control.py` | the control socket: keys, captures and a debugger into a running machine |
 | `src/dos_emulator/__init__.py` | what a dependent project imports |
 | `skills/dos-game-reconstruction/` | the method: how to reverse a DOS game and reconstruct it, and how to prove the result |
 

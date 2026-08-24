@@ -89,19 +89,37 @@ DOS_FN = {
 }
 
 
-def host_path(dos_path):
-    """Resolve a DOS path to a real path, case-insensitively, inside GAME_DIR."""
-    p = dos_path.replace("\\", "/").lstrip("/")
+def host_path(dos_path, cwd=""):
+    """Resolve a DOS path to a real path, case-insensitively, inside GAME_DIR.
+
+    `cwd` is the guest's current directory as a GAME_DIR-relative DOS path (""
+    is the root). A path beginning with a backslash, or with a drive letter, is
+    absolute and ignores it; anything else is relative to it, which is what
+    makes chdir mean something. Tools with no machine in hand call this with
+    one argument and get the root, as before.
+
+    GAME_DIR is a floor, not a starting point: `..` at the root stays at the
+    root. Ducks' egg selector, PickEggs, lists directories and climbs back out
+    of them with `..`, and a resolver that could be walked out of would make
+    the game directory a suggestion rather than a guarantee.
+    """
+    raw = dos_path.replace("\\", "/")
+    absolute = raw.startswith("/") or (len(raw) > 1 and raw[1] == ":")
+    p = raw.lstrip("/")
     if len(p) > 1 and p[1] == ":":
         p = p[2:].lstrip("/")
-    cur = GAME_DIR
+    if not absolute and cwd:
+        p = cwd.replace("\\", "/").strip("/") + "/" + p
+    root = GAME_DIR
+    cur = root
     if not p:
         return cur
     for part in p.split("/"):
         if part in ("", "."):
             continue
         if part == "..":
-            cur = os.path.dirname(cur)
+            cur = cur if os.path.abspath(cur) == os.path.abspath(root) \
+                else os.path.dirname(cur)
             continue
         try:
             entries = os.listdir(cur)
@@ -143,7 +161,16 @@ class DosMachine:
         self.overlay = {}   # DOS path -> bytes, for files the game creates
         self.file_ops = []  # always recorded, regardless of verbosity
         self.next_handle = 5
+        # The Disk Transfer Area, where find-first/find-next leave their
+        # result. DOS defaults it to PSP:0080, and a program that never calls
+        # AH=1Ah is relying on exactly that.
         self.dta = (PSP_SEG, 0x80)
+        # The guest's current directory, as a GAME_DIR-relative DOS path with
+        # backslashes; "" is the root. Every path the guest names is resolved
+        # against this, so chdir (AH=3Bh) is the one place it changes.
+        self.cwd = ""
+        self.finds = {}          # find-first id -> entries still to hand out
+        self.find_seq = 0
         self.finished = None
         self.blocks = 0
         self.video_modes = []
@@ -451,6 +478,112 @@ class DosMachine:
             return
 
     # ------------------------------------------------------------------- DOS
+    @staticmethod
+    def _dos_match(name, pattern):
+        """DOS 8.3 wildcard matching, which is not fnmatch.
+
+        The difference is the one that matters here: DOS splits both sides
+        into an 8-character name and a 3-character extension and matches them
+        SEPARATELY, so `*` is name-wild with an EMPTY extension - it matches
+        README but not README.TXT. That is how a program lists
+        subdirectories: findfirst("*", FA_DIREC) works because directories
+        have no extension. Treating `*` as fnmatch does, matching everything,
+        hands back the files too - which is what put every .EGG in Ducks'
+        PickEggs directory pane twice.
+
+        Within a field, `*` fills the rest of it with `?`, and `?` matches one
+        character or the end of the field.
+        """
+        def split(v):
+            # . and .. are directory entries whose NAME is the dots and whose
+            # extension is blank; partitioning on "." would make the
+            # extension a dot and stop `*` from matching them, which is how a
+            # browser loses the entry it climbs out by.
+            if v in (".", ".."):
+                return v, ""
+            base, dot, ext = v.partition(".")
+            return base[:8], (ext[:3] if dot else "")
+
+        def field(val, pat, width):
+            expanded = ""
+            for ch in pat:
+                if ch == "*":
+                    expanded += "?" * (width - len(expanded))
+                    break
+                expanded += ch
+            if len(expanded) < len(val):
+                return False
+            for i, pc in enumerate(expanded):
+                vc = val[i] if i < len(val) else ""
+                if pc == "?":
+                    continue
+                if vc != pc:
+                    return False
+            return True
+
+        n, e = split(name)
+        pn, pe = split(pattern)
+        return field(n, pn, 8) and field(e, pe, 3)
+
+    def _find_entries(self, pattern, attr_mask):
+        """Directory entries matching a DOS wildcard, as (name, size, mtime, dir).
+
+        The mask is a *permission* rather than a filter: DOS returns ordinary
+        files always, and directories only when bit 4 is asked for. Getting
+        that backwards hides every file behind a mask of 0.
+        """
+        p = pattern.replace("/", "\\")
+        directory, _, leaf = p.rpartition("\\")
+        base = host_path(directory, self.cwd) if directory else \
+            host_path("", self.cwd)
+        leaf = (leaf or "*.*").upper()
+        want_dirs = bool(attr_mask & 0x10)
+        out = []
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            return out
+        # DOS lists . and .. in any directory below the root, and a browser
+        # needs the second one to climb back out. host_path floors `..` at
+        # GAME_DIR, so following it cannot leave the game directory.
+        if want_dirs and self.cwd:
+            names = [".", ".."] + names
+        for name in names:
+            full = os.path.join(base, name)
+            is_dir = os.path.isdir(full)
+            if is_dir and not want_dirs:
+                continue
+            up = name.upper()
+            if not self._dos_match(up, leaf):
+                continue
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            out.append((up, 0 if is_dir else st.st_size, st.st_mtime, is_dir))
+        return out
+
+    def _write_dta(self, fid, entry):
+        """Fill the 43-byte find block DOS leaves at the DTA."""
+        name, size, mtime, is_dir = entry
+        t = time.localtime(mtime)
+        dos_date = ((max(t.tm_year - 1980, 0) & 0x7F) << 9) | \
+                   (t.tm_mon << 5) | t.tm_mday
+        dos_time = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
+        blob = bytearray(43)
+        # The first 21 bytes are DOS's private search state. We only need to
+        # find our way back to the pending list, so the id goes at the front.
+        blob[0:2] = struct.pack("<H", fid)
+        blob[21] = 0x10 if is_dir else 0x20
+        blob[22:24] = struct.pack("<H", dos_time)
+        blob[24:26] = struct.pack("<H", dos_date)
+        blob[26:30] = struct.pack("<I", min(size, 0xFFFFFFFF))
+        raw = name.encode("ascii", "replace")[:12]
+        blob[30:30 + len(raw)] = raw
+        blob[30 + len(raw)] = 0
+        seg, off = self.dta
+        self.uc.mem_write(seg * 16 + off, bytes(blob))
+
     def _dos(self):
         ax = self._reg(UC_X86_REG_AX)
         ah, al = ax >> 8, ax & 0xFF
@@ -513,7 +646,8 @@ class DosMachine:
             name = self._str(ds, dx)
             key = name.replace("/", "\\").upper()
             if (ax & 0xFF) == 0:
-                exists = key in self.overlay or os.path.isfile(host_path(name))
+                exists = key in self.overlay or os.path.isfile(
+                    host_path(name, self.cwd))
                 if exists:
                     self._set(UC_X86_REG_CX, 0x20)      # archive bit
                     self._cf(False)
@@ -533,14 +667,46 @@ class DosMachine:
                 self._set(UC_X86_REG_AX, 0)
             return
         if ah == 0x47:
+            # DS:SI gets the path WITHOUT a leading backslash and without the
+            # drive, which is why the root is the empty string rather than
+            # "\\".
             self.uc.mem_write(self._reg(UC_X86_REG_DS) * 16 +
-                              self._reg(UC_X86_REG_SI), b"\x00")
+                              self._reg(UC_X86_REG_SI),
+                              self.cwd.encode("ascii", "replace") + b"\x00")
+            self._set(UC_X86_REG_AX, 0x0100)
+            return
+
+        if ah == 0x3B:
+            # Set the current directory. Answering "unsupported" to this is
+            # what left PickEggs' file browser empty: it chdirs before listing,
+            # and took the failure as "there is nothing there".
+            name = self._str(ds, dx)
+            hp = host_path(name, self.cwd)
+            root = os.path.abspath(GAME_DIR)
+            target = os.path.abspath(hp)
+            inside = (target == root or
+                      os.path.commonpath([target, root]) == root)
+            if inside and os.path.isdir(target):
+                rel = os.path.relpath(target, root)
+                # Upper case, because that is what DOS reports and what the
+                # guest then writes into its own files: PickEggs' EGGS.INI
+                # came out with one path spelled C:\\EGGS and the next
+                # C:\\Eggs, the second being the host directory's real name
+                # leaking through. The walk in host_path is case-insensitive,
+                # so this still resolves.
+                self.cwd = "" if rel == "." else rel.replace("/", "\\").upper()
+                self._fop(f"CHDIR {name!r} -> {self.cwd or chr(92)!r}")
+                self._cf(False)
+            else:
+                self._fop(f"CHDIR {name!r} -> NOT FOUND")
+                self._cf(True)
+                self._set(UC_X86_REG_AX, 3)      # path not found
             return
 
         # ---- file services ----
         if ah in (0x3D, 0x3C, 0x5B):
             name = self._str(ds, dx)
-            hp = host_path(name)
+            hp = host_path(name, self.cwd)
             creating = ah in (0x3C, 0x5B)
             key = name.replace("/", "\\").upper()
             if creating:
@@ -668,9 +834,34 @@ class DosMachine:
             self.overlay.pop(name.replace("/", "\\").upper(), None)
             self._fop(f"DELETE {name!r}")
             return
+        if ah == 0x1A:
+            self.dta = (ds, dx)
+            return
         if ah in (0x4E, 0x4F):
-            self._cf(True)
-            self._set(UC_X86_REG_AX, 18)      # no more files
+            # These used to answer "no more files" unconditionally, which is
+            # not the same as being unimplemented: PickEggs asks, is told the
+            # directory is empty, and draws an empty browser. Nothing appears
+            # in the unhandled-call log, so the gap reads as a program that
+            # never looked.
+            if ah == 0x4E:
+                pattern = self._str(ds, dx)
+                entries = self._find_entries(pattern, cx)
+                self.find_seq = (self.find_seq + 1) & 0xFFFF
+                fid = self.find_seq
+                self.finds[fid] = entries
+                self._fop(f"FINDFIRST {pattern!r} attr={cx:#04x} -> "
+                          f"{len(entries)} match(es) "
+                          f"{[(e[0], 'dir' if e[3] else 'file') for e in entries]}")
+            else:
+                fid = struct.unpack("<H", self._rd(*self.dta, 2))[0]
+                entries = self.finds.get(fid, [])
+            if not entries:
+                self._cf(True)
+                self._set(UC_X86_REG_AX, 18)      # no more files
+                return
+            self._write_dta(fid, entries.pop(0))
+            self._cf(False)
+            self._set(UC_X86_REG_AX, 0)
             return
         if ah in (0x4C, 0x00):
             self.finished = f"INT 21h AH={ah:02x}h exit code {al}"
@@ -701,6 +892,67 @@ class DosMachine:
         if self.finished is None:
             self.finished = f"instruction budget ({self.max_insns}) exhausted"
         return self.finished
+
+    def shutdown(self):
+        """Called once by main() when the run is over. Nothing to do here.
+
+        A subclass that keeps state the guest expects to outlive the process
+        - Ducks writes saves through to its game directory - finishes it here.
+        """
+
+    def report(self, out=print):
+        """Print the census a headless run is for: what the program used.
+
+        Every interrupt and DOS function, every vector it hooked, every file it
+        read, tried to write, or could not find, and the ports it touched.
+        This was the first tool the Ducks project ran, before any window
+        existed: a static disassembly of 100 KB of 16-bit code desynchronises
+        too often to answer "which files does this open", and running it can.
+        """
+        if self.stdout:
+            out("=== program console output ===")
+            txt = self.stdout.decode("latin1")
+            for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                out(f"  | {line}")
+
+        out("=== interrupts used ===")
+        for n, c in sorted(self.int_counts.items()):
+            g = self.guest_dispatch.get(n, 0)
+            tag = f"  -> {g} dispatched to the program's own handler" if g else ""
+            out(f"  INT {n:02x}h  x{c}{tag}")
+
+        out("=== interrupt vectors the program hooked ===")
+        for v, (seg, off) in sorted(self.hooked_vectors.items()):
+            note = {0x00: "divide by zero", 0x02: "NMI", 0x04: "overflow",
+                    0x08: "timer (IRQ0)", 0x09: "keyboard (IRQ1)",
+                    0x1B: "Ctrl-Break", 0x1C: "timer tick",
+                    0x23: "Ctrl-C", 0x24: "critical error"}.get(v, "")
+            if 0x34 <= v <= 0x3E:
+                note = "Borland 80x87 FP emulation"
+            out(f"  INT {v:02x}h -> {seg:04x}:{off:04x}  {note}")
+
+        out("=== INT 21h functions used ===")
+        for ah, c in sorted(self.dos_counts.items()):
+            out(f"  AH={ah:02x}h x{c:<6} {DOS_FN.get(ah, '?')}")
+
+        out("=== files READ ===")
+        for k, v in sorted(self.files_read.items()) or [("(none)", 0)]:
+            out(f"  {k!r}  {v} bytes")
+        out("=== files the program tried to WRITE ===")
+        for k, v in sorted(self.files_written.items()) or [("(none)", 0)]:
+            out(f"  {k!r}  {v} bytes")
+        out("=== files NOT FOUND ===")
+        for k in self.files_missing or ["(none)"]:
+            out(f"  {k!r}")
+
+        out("=== port I/O (top 20) ===")
+        for p, c in self.port_out.most_common(20):
+            out(f"  OUT {p:#06x} x{c}")
+        for p, c in self.port_in.most_common(10):
+            out(f"  IN  {p:#06x} x{c}")
+        if self.video_modes:
+            out(f"=== video modes set: "
+                f"{[hex(v) for v in self.video_modes]} ===")
 
 # Where the XMS entry-point stub lives: low memory, above the BIOS data area
 # and below the PSP, so it collides with nothing the program uses.
@@ -840,7 +1092,16 @@ PORTS = {
 
 
 class VgaDos(DosMachine):
-    def __init__(self, exe, blaster=False, **kw):
+    # What main() prints about the host filesystem, so a subclass that changes
+    # the rule (Ducks writes saves through) can say so in the same place.
+    fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
+
+    def __init__(self, exe, blaster=False, vsync_hz=60.0, **kw):
+        # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
+        # CGA, which is what Popcorn was written for and paces on. A VGA
+        # refreshes its 200-line modes at 70 Hz, and a game that paces on the
+        # retrace - Ducks does - runs a sixth slow at the CGA rate.
+        self.vsync_hz = vsync_hz
         self.palette = [(0, 0, 0)] * 256
         self.dac_index = 0
         self.dac_phase = 0
@@ -1097,10 +1358,10 @@ class VgaDos(DosMachine):
             # transition of bit 0 for every single word it copies, so this bit
             # must flip far faster than the emulator can be clocked from wall
             # time; toggle it per read instead.
-            # CGA is 60 Hz, not the VGA 70 the Ducks model assumed. The game
-            # waits for this bit around every blit, so the rate it comes back
-            # at is one of the two things setting the frame rate.
-            vsync = 0x08 if (el * 60.0) % 1.0 > 0.92 else 0x00
+            # 60 Hz for a CGA, 70 for a VGA - see vsync_hz. The game waits
+            # for this bit around every blit, so the rate it comes back at is
+            # one of the two things setting the frame rate.
+            vsync = 0x08 if (el * self.vsync_hz) % 1.0 > 0.92 else 0x00
             return vsync | (0x01 if (n & 1) else 0x00)
         if port in (0x40, 0x41, 0x42):
             ch = port - 0x40
@@ -1205,8 +1466,12 @@ class VgaDos(DosMachine):
         code = scancode if down else (scancode | 0x80)
         if self.guest_owns_keyboard():
             self.scan_queue.append((code, ascii_))
-        elif down:
-            self.key_buf.append((scancode, ascii_))
+        else:
+            if down:
+                self.key_buf.append((scancode, ascii_))
+            # Port 0x60 shows the last transition either way. A program on
+            # the BIOS path may still read it for key-up - Ducks does - and a
+            # release that never arrives there is a key held down forever.
             self.last_scancode = code
 
     def service_keyboard(self):
@@ -1965,7 +2230,13 @@ def capture(m, screen, tag, outdir="debug"):
     return base
 
 
-def main():
+def main(argv=None, *, make_machine=None, add_arguments=None):
+    """The window, the event loop, and the command line.
+
+    A project wraps this rather than copying it: `add_arguments(parser)` adds
+    its own flags, and `make_machine(args)` builds its subclass of VgaDos from
+    them. Both default to what a bare run of the emulator does.
+    """
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2023,7 +2294,14 @@ def main():
                     help="stop after this many seconds (0 = run until quit)")
     ap.add_argument("--mouse-debug", action="store_true",
                     help="log every mouse button event and INT 33h query")
-    args = ap.parse_args()
+    ap.add_argument("--control-socket", default="", metavar="PATH",
+                    help="listen on this Unix socket for one-line commands "
+                         "while the program runs: keys, breakpoints, memory "
+                         "reads and pokes, a disassembly, a stack walk. See "
+                         "dos_emulator.control")
+    if add_arguments is not None:
+        add_arguments(ap)
+    args = ap.parse_args(argv)
 
     global TRACE_TEXT, WATCH_DGROUP
     TRACE_TEXT = args.text_trace
@@ -2046,14 +2324,21 @@ def main():
     global GAME_CODE
     GAME_CODE = args.code_base
 
-    m = VgaDos(args.program, blaster=args.blaster, max_insns=1 << 62,
-               cmdline=args.cmdline)
+    if make_machine is not None:
+        m = make_machine(args)
+    else:
+        m = VgaDos(args.program, blaster=args.blaster, max_insns=1 << 62,
+                   cmdline=args.cmdline)
     audio = None
     if args.blaster and not args.no_audio and not headless:
         audio = AudioSink()
     print(f"=== running {args.program} "
           f"(BLASTER {'set' if args.blaster else 'unset'}) ===")
-    print("    host filesystem READ-ONLY; writes intercepted in memory")
+    print(f"    {m.fs_note}")
+    control = None
+    if args.control_socket:
+        from .control import Control
+        control = Control(args.control_socket)
 
     pygame.font.init()
     CELL = (8, 16)
@@ -2140,7 +2425,25 @@ def main():
 
     budget_t = time.perf_counter()
     while running:
-        if not paused:
+        # The socket is served here, between emu_start calls, so a command
+        # never touches the machine underneath a running slice. `frames` is
+        # what a key press over it is held against.
+        m.frames = frames
+        if control is not None:
+            control.service(m, can_run=True)
+        if getattr(m, "ctl_paused", False):
+            # Stopped at a breakpoint. Keep the window alive and the socket
+            # served - that is the only way back out - but run nothing.
+            hit = getattr(m, "ctl_hit", None)
+            if hit is not None:
+                print(f"  [ctl] stopped at {hit:#07x}; `cont` to resume")
+                m.ctl_hit = None
+            addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
+            time.sleep(0.01)
+        elif not paused:
+            # A `step` or `until` over the socket has just moved CS:IP, and
+            # resuming from the address the loop was holding would jump back.
+            addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
             slice_start = time.perf_counter()
             m.blocked_on_input = False
             # Run the chunk in slices, servicing sound between each. A whole
@@ -2160,6 +2463,16 @@ def main():
                     break
                 if m.finished:
                     print(f"  [dos] program exited: {m.finished}")
+                    running = False
+                    break
+                if getattr(m, "ctl_paused", False):
+                    # A breakpoint fired inside this chunk. Stop here rather
+                    # than finishing the remaining slices, or the machine
+                    # runs on for up to a chunk past the address that was
+                    # armed - which is exactly the gap breakpoints exist to
+                    # close.
+                    break
+                if getattr(m, "quit_requested", False):
                     running = False
                     break
                 addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
@@ -2266,6 +2579,17 @@ def main():
                               f"{'down' if ev.type == pygame.MOUSEBUTTONDOWN else 'up'}"
                               f" at {m.mouse_pos} mask={m.mouse_btn:#03x}")
 
+        # A capture asked for over the socket. There is no machine-snapshot
+        # format at this layer, so it is the same PNG-and-state capture the
+        # key gives; a project with a snapshot module of its own honours the
+        # flag in its own loop instead.
+        if getattr(m, "snapshot_requested", None):
+            note = m.snapshot_requested
+            m.snapshot_requested = None
+            cap_n += 1
+            capture(m, screen, f"cap{cap_n:02d}")
+            print(f"  [ctl] captured on request: {note}")
+
         # File-based control, so a capture can be requested from outside the
         # window: `touch capture.request` / `touch pause.request`.
         if os.path.exists("capture.request"):
@@ -2340,9 +2664,15 @@ def main():
         if not headless:
             clock.tick(60)
 
+    m.shutdown()
+    if control is not None:
+        control.close()
     print(f"\n=== finished after {frames} display updates, "
           f"{m._elapsed():.1f}s ===")
     print(f"  video modes set : {[hex(v) for v in m.video_modes]}")
+    if m.hooked_vectors:
+        print(f"  vectors hooked  : "
+              f"{{{', '.join(f'{v:02x}h' for v in sorted(m.hooked_vectors))}}}")
     print(f"  DAC palette sets: {m.palette_writes}")
     print(f"  interrupts used : "
           f"{{{', '.join(f'{n:02x}h:{c}' for n, c in sorted(m.int_counts.items()))}}}")

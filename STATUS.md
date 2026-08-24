@@ -15,11 +15,13 @@ Updated 2026-08-25.
 | **Popcorn** (Lacaze / Raynal, LACRAL software, 1988) | CGA mode 05h, the PC speaker, its own INT 09h handler reading port 0x60, INT 33h mouse, EXEPACK recovery | the deepest use so far: a full C reimplementation was checked against it frame by frame and routine by routine, 163 of 166 routines proven byte-identical |
 | **POPGEN** (Popcorn's level editor) | text mode 03h, BIOS keyboard via INT 16h, INT 21h AH=19h/47h | ran unmodified the first time; its file formats were measured through it |
 | **POPSPEED** (Popcorn's speed utility) | INT 21h AX=2568h and nothing else | trivial - sets an interrupt vector and exits |
-| **Ducks** | Sound Blaster, XMS | the earlier project `sb.py` and `xms.py` come from. Popcorn uses neither, so those two modules are **carried but not currently re-verified** |
+| **Ducks** (Furnish / Hungry Software, 1998-2000) | VGA mode 13h switched to Mode X - planar writes through the map mask, the CRTC start address, the DAC; Sound Blaster 8-bit auto-init DMA on IRQ 5; XMS; the BIOS keyboard and port 0x60; INT 33h mouse; the control socket | the project the VGA, Sound Blaster, XMS, directory-service and control-socket code come from. Rebased onto this emulator on 2026-08-25: its own port's checks ran unchanged through it - the snapshot-replay comparison of its natives against the original, and its C-against-guest tests - and `Ducks.unpacked.exe` runs here from the README through the splash to the menu and its demo level, with the DAC, planar and DMA paths live. See the Ducks repository's STATUS.md for the numbers |
+| **PickEggs** (Ducks' egg selector) | text mode 03h, INT 21h AH=1Ah/3Bh/47h/4Eh/4Fh - a directory browser | its file-operation log and its screen came out byte-identical to the Ducks project's own emulator on 2026-08-25 |
 
 Popcorn is the reason most of this exists, and it is why the CGA and PC-speaker
-paths are the best-tested part. Anything a game has not needed yet should be
-treated as untested, however plausible it looks.
+paths are the best-tested part; Ducks is where the VGA and the sound card came
+from, and it is now a second dependent with its own sweep. Anything a game has
+not needed yet should be treated as untested, however plausible it looks.
 
 ## What it supports
 
@@ -33,11 +35,20 @@ treated as untested, however plausible it looks.
 ### DOS (INT 21h)
 
 Implemented: 00h and 4Ch (exit), 02h/06h/09h (character and string output),
-01h/06h/07h/08h/0Ah (input), 19h (current drive), 25h/35h (set and get
-interrupt vector), 30h (DOS version), 36h (free space), 3Ch/3Dh/5Bh (create and
-open), 3Eh (close), 3Fh (read), 40h (write), 41h (delete), 42h (seek), 43h
-(attributes), 44h (IOCTL), 47h (current directory), 48h/49h/4Ah (memory),
-4Eh/4Fh (find first and next), 62h (PSP address).
+01h/06h/07h/08h/0Ah (input), 19h (current drive), 1Ah (set DTA), 25h/35h (set
+and get interrupt vector), 30h (DOS version), 36h (free space), 3Bh (change
+directory), 3Ch/3Dh/5Bh (create and open), 3Eh (close), 3Fh (read), 40h
+(write), 41h (delete), 42h (seek), 43h (attributes), 44h (IOCTL), 47h (current
+directory), 48h/49h/4Ah (memory), 4Eh/4Fh (find first and next), 62h (PSP
+address).
+
+The guest has a **current directory**, kept as a path relative to the game
+directory, and every path it names resolves against it. Find-first/next list
+real entries, matched by DOS's 8.3 rule rather than fnmatch's - `*` matches
+README and not README.TXT, which is how a program lists subdirectories - and
+`..` is floored at the game directory, so a browser can climb out of a
+subdirectory but never out of the guest's world. All of this came from Ducks'
+PickEggs, whose directory pane was empty until 3Bh and 4Eh answered honestly.
 
 **Writes never reach the host.** They are satisfied from an in-memory overlay
 and logged. A guest can save its game, rewrite its high scores or save from its
@@ -53,7 +64,18 @@ level editor, and nothing on disk changes.
   them
 - interlaced CGA addressing (even rows at 0, odd at 0x2000), the mode-control
   and colour-select ports 0x3d8/0x3d9, and vertical retrace on 0x3da bit 3
-- INT 10h AH=00h (set mode) and AH=0Ch/0Dh (write and read pixel)
+- **VGA** mode 13h, and **Mode X** when the program turns chain-4 off through
+  the sequencer: the map mask (0x3c4 index 2) selects which of four plane
+  shadows a write lands in, the CRTC start address and offset (0x3d4 indexes
+  0Ch/0Dh/13h, counted in bytes, words or doublewords as 14h/17h say) pan the
+  display, and the framebuffer is interleaved back from the planes. The DAC at
+  0x3c8/0x3c9. Ducks draws everything this way
+- vertical retrace on 0x3da bit 3 at `vsync_hz`: 60 by default, a CGA, and 70
+  for a VGA - Ducks paces on it and runs a sixth slow at 60
+- INT 10h AH=00h (set mode), 02h/03h (cursor), 05h (page), 06h/07h (scroll),
+  08h/09h/0Ah/0Eh (character read and write, teletype), 0Ch/0Dh (write and
+  read pixel), 0Fh (mode query), 10h/10h and 10h/12h (DAC registers). The
+  text ones are what Ducks' README screen and PickEggs draw with
 - mode geometry known for 00h, 01h, 04h, 05h, 06h, 0Dh, 0Eh, 10h, 12h and 13h
 
 ### Input
@@ -69,33 +91,54 @@ level editor, and nothing on disk changes.
 
 - PC speaker: PIT channel 2 through ports 0x42/0x43 and the gate at 0x61,
   rendered to an SDL audio stream and optionally to a `.wav`
-- Sound Blaster (`sb.py`): DSP commands, the mixer, DMA playback — *inherited,
-  not currently exercised*
-- XMS (`xms.py`): the INT 2Fh hook, handles and block moves — *inherited, not
-  currently exercised*
+- Sound Blaster (`sb.py`): DSP commands, the mixer, 8-bit auto-init DMA
+  playback with IRQ 5 - exercised by Ducks, which streams its samples this way
+- XMS (`xms.py`): the INT 2Fh hook, handles and block moves - exercised by
+  Ducks, which keeps its samples in extended memory and has no sound without it
 
 ### Running unattended
 
-Wall-clock key scripting, headless screenshots, a run-time limit, an
-instructions-per-second budget for pacing, and per-run statistics: which
-interrupts and DOS functions were used, which files were read and written,
-which ports were touched.
+Wall-clock key scripting, key presses triggered by execution reaching a code
+offset, headless screenshots, a run-time limit, an instructions-per-second
+budget for pacing, and per-run statistics: which interrupts and DOS functions
+were used, which vectors were hooked, which files were read and written, which
+ports were touched (`DosMachine.report()` prints the census).
+
+A **control socket** (`--control-socket PATH`, `control.py`): one-line
+commands into the running machine - keys, a capture, status, and a debugger:
+breakpoints, `step`, `until`, `finish`, `regs`, `read`, `write`, `disasm`, a
+stack walk. Came from Ducks, where a driver that asks which screen the guest is
+on before pressing replaced the wall-clock scripts that missed.
 
 ## Known gaps
 
-- **EGA and VGA are geometry only.** The mode table knows their dimensions;
-  planar addressing, the sequencer's map mask and the DAC are not modelled. The
-  first game that needs mode 0Dh or 13h will have to add them.
+- **EGA is geometry only.** The planar model is Mode X's - four planes of
+  mode 13h pixels selected by the map mask. The 16-colour planar modes (0Dh,
+  0Eh, 10h, 12h) with the graphics controller's write modes, bit masks and
+  the attribute controller's palette are not modelled; the first game that
+  needs them will have to add them. (Until 2026-08-25 this entry said VGA was
+  geometry only too. It was not - the Mode X model had been carried from Ducks
+  all along, unexercised, and the note was written from a belief rather than
+  from the code.)
 - **No PIT channel 0 timer interrupt.** Nothing has needed INT 08h yet. A game
   that paces on it rather than on retrace will not run.
-- **INT 10h is thin** - mode set and pixel access. No BIOS text output, no
-  scroll, no palette calls. Programs that draw text through the BIOS rather
-  than by writing to 0xb8000 will need it.
+- **INT 10h covers what two text-mode programs and one VGA game asked for** -
+  see *Video*. No 13h (write string), no 1Ah/1Bh, and a program that reads
+  the DAC back (10h/15h, 10h/17h) gets nothing. (Until 2026-08-25 this entry
+  said "mode set and pixel access" only; the cursor, scroll and teletype
+  functions had been carried from Ducks all along.)
 - **No EMS**, no networking, no serial, no joystick beyond the port being named.
-- **Sound Blaster and XMS are unverified** against any current game. Treat them
-  as a starting point rather than as working code.
+- **Sound Blaster and XMS are verified only as far as Ducks uses them**: 8-bit
+  auto-init DMA output at one rate, IRQ 5, the mixer registers it touches, and
+  XMS allocate/free/move. No 16-bit or ADPCM DSP modes, no recording, no EMS.
 - **EXEPACK recovery lives outside this repository** - it is in the Popcorn
   project and should move here.
+- **No machine-snapshot format at this layer.** Popcorn and Ducks each carry
+  a `snapshot.py`, and they have diverged (Ducks' captures the VGA planes, the
+  XMS blocks and the sound card; Popcorn's is 300 lines to its 700). The
+  control socket's `snap` verb only sets `snapshot_requested` on the machine;
+  the bare `main()` answers it with the PNG-and-state capture, and a project's
+  own loop answers it with its own format.
 - **No tests of its own.** The dependent projects' verification sweeps are the
   test suite, which works but means a change cannot be checked without one of
   them checked out.
@@ -106,5 +149,5 @@ which ports were touched.
 - Convert Popcorn to import from here and subclass, rather than carrying its own
   copy. That is the change that would prove the extension points are in the
   right places - and the one most likely to reveal they are not.
-- Re-verify `sb.py` and `xms.py` against whichever game needs them next, and
-  move them out of "inherited" in the table above when that happens.
+- One snapshot format, here, that both projects' `snapshot.py` become
+  subclasses or thin wrappers of - see *Known gaps*.
