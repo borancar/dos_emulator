@@ -96,6 +96,9 @@ which ports were touched.
   as a starting point rather than as working code.
 - **EXEPACK recovery lives outside this repository** - it is in the Popcorn
   project and should move here.
+- **No tests of its own.** The dependent projects' verification sweeps are the
+  test suite, which works but means a change cannot be checked without one of
+  them checked out.
 
 ## Next
 

@@ -51,8 +51,8 @@ import pygame
 from unicorn import *
 from unicorn.x86_const import *
 
-from sb import SoundBlaster
-from xms import XMS
+from .sb import SoundBlaster
+from .xms import XMS
 
 # The directory the guest sees as its own. A DOS program's files *were* its
 # directory, so this defaults to wherever the executable is, and every DOS path

@@ -81,7 +81,12 @@ In particular:
 
 ## Conventions
 
-- Python 3, `unicorn`, `pygame-ce`, `numpy`. No other runtime dependencies —
-  this has to be easy to drop into a project.
+- Python 3, `unicorn` and `pygame-ce`, and nothing else — this has to be easy
+  to drop into a project. Managed with `uv`; `uv sync` sets up, `uv run
+  dos-emulator` runs.
+- `src/` layout, so the package cannot be imported without being installed.
+  Anything a dependent project needs is re-exported from `__init__.py`; adding
+  to that list is how the public API grows, and it is worth being deliberate
+  about, since removing from it later breaks somebody.
 - Comments explain **why**, and cite the program that motivated the behaviour.
 - GPL-2.0-only. New files carry the SPDX header the existing ones do.

@@ -8,8 +8,19 @@ can be checked against it: frame by frame, routine by routine, byte for byte.
 Everything here exists to make a port provable rather than plausible.
 
 ```sh
-pip install unicorn pygame-ce numpy
-python dos_emulator.py GAME.EXE --scale 3
+uv run dos-emulator GAME.EXE --scale 3
+```
+
+`uv sync` installs it; `python -m dos_emulator GAME.EXE` works too, and so does
+importing it, which is the point — see *Layering* below.
+
+**As a dependency**, pin the commit. A coverage figure or a cycle count is only
+reproducible if you can say which emulator produced it:
+
+```toml
+dependencies = [
+  "dos-emulator @ git+https://github.com/borancar/dos_emulator@<tag-or-sha>",
+]
 ```
 
 ## What it provides
@@ -51,11 +62,11 @@ Neither of these needs a display:
 
 ```sh
 # script input against the wall clock, and write PNGs
-python dos_emulator.py GAME.EXE --keys 11:f1,14:space \
+uv run dos-emulator GAME.EXE --keys 11:f1,14:space \
     --shots 4 --shot-every 4 --shot-dir out --run-seconds 30
 
 # a DOS command tail, as `GAME LEVELS` would give it
-python dos_emulator.py GAME.EXE --cmdline LEVELS
+uv run dos-emulator GAME.EXE --cmdline LEVELS
 ```
 
 `--keys` times presses against the **wall clock**, and emulator speed varies
@@ -86,9 +97,14 @@ before pushing.
 
 | | |
 | --- | --- |
-| `dos_emulator.py` | the machine, the DOS/BIOS shim, the video and input layers, and the CLI |
-| `sb.py` | a Sound Blaster model — DSP commands, the mixer, DMA playback |
-| `xms.py` | an XMS driver: the `INT 2Fh` hook, handles, and block moves |
+| `src/dos_emulator/emulator.py` | the machine, the DOS/BIOS shim, the video and input layers, and the CLI |
+| `src/dos_emulator/sb.py` | a Sound Blaster model — DSP commands, the mixer, DMA playback |
+| `src/dos_emulator/xms.py` | an XMS driver: the `INT 2Fh` hook, handles, and block moves |
+| `src/dos_emulator/__init__.py` | what a dependent project imports |
+
+A `src/` layout on purpose: it cannot be imported from the working directory
+without installing, so a packaging mistake fails here rather than in the
+project that depends on it.
 
 ## Licence
 
