@@ -1,0 +1,491 @@
+---
+name: dos-game-reconstruction
+description: Reverse-engineer a DOS game binary and reconstruct it as modern C. Use when porting a DOS executable to C/SDL from its disassembly, building an emulator as a correctness reference, transcribing 16-bit assembly routines, or verifying a port against the original. Covers EXEPACK recovery, layered emulation, differential per-routine verification, frame lockstep, reaching unreached code, and cycle-accurate timing.
+---
+
+# Reconstructing a DOS game in C
+
+The method: **two artefacts that check each other.** An emulator running the
+original binary is the *reference* — it defines what "correct" means. The C
+port is the *deliverable*. Neither is trusted alone, and nothing is finished
+because it looks right on screen.
+
+A blitter can be wrong in ways that still draw something plausible. A routine
+is done when the original has been run against it and the two agreed.
+
+## The standing goal: transcribe everything discoverable, then ask
+
+**The default mode of work is autonomous bulk transcription.** Before involving
+the user in anything, port every routine the code map can reach on its own.
+That is the goal, and it is not finished until the coverage tool says so.
+
+Work it as a loop, and do not stop early:
+
+1. Re-run the code map and the coverage tool. **Derive the remaining list every
+   pass** — never work from a list remembered from earlier, because it goes
+   stale the moment a newly transcribed routine reveals a call to something
+   unmapped.
+2. Take the next untranscribed routine. Disassemble it, transcribe it, wire it
+   into the verifier's dispatch.
+3. Verify it against the original if any reachable state calls it. If none
+   does, say so in `STATUS.md` rather than counting it as done.
+4. Repeat from 1.
+
+The loop ends when the tool reports every reachable routine transcribed — not
+when the interesting ones are done, not when the count stops moving easily, and
+not at a natural-looking stopping point.
+
+**Do not stop to ask permission to continue.** These are all failure modes:
+
+- "I've transcribed 40 routines, shall I keep going?"
+- stopping to summarise progress and waiting for a reply
+- doing the easy routines and reporting the hard ones as a question
+- treating a long task as a reason to check in rather than a reason to continue
+- declaring the port done when what is done is the transcription — those are
+  different claims, and the second is worth far less than the first
+
+If you find yourself writing a progress report with no question in it, keep
+working instead.
+
+**Driving it with a Ralph loop.** This pattern suits the `ralph-loop` plugin:
+set a completion promise the coverage tool can settle, so the loop feeds the
+same prompt back until the work is genuinely finished. The promise must be
+**true**, and a promise about transcription must not be worded so that
+verification appears finished too. Never emit a false completion to escape a
+loop that feels long — a run that stops at 90% and says it stopped is worth
+more than one that claims 100%.
+
+**When to involve the user** — these are the real reasons, and they are narrow:
+
+- behaviour the emulator cannot settle, where the original is genuinely
+  ambiguous and a guess would be invented rather than observed
+- a **scope** decision: whether a screen should be ported at all, rather than
+  how
+- anything outward-facing or hard to reverse — publishing, force-pushing,
+  deleting captures
+- the discoverable set is exhausted and what remains needs a human to reach
+  (an input sequence nothing automated can drive, a state behind a name entry)
+
+Everything else — a routine that is tedious, a routine that is long, a routine
+whose purpose is unclear until it is read — is the work, not a blocker.
+
+## The order of work
+
+**1. Find out what is already known, before starting.**
+DOS-era games often have a modding community that documented the file formats
+years ago, and re-deriving a sprite container from scratch when a wiki page
+describes it is wasted weeks.
+
+Look at:
+
+- **The game's own shipped documentation.** A readme, manual or `.DOC` beside
+  the executable is a *primary source* — the authors' own word on the level
+  editor, the speed utility's range, the menu keys, sometimes the licence.
+  Read it first; it is the cheapest information you will ever get.
+- **The ModdingWiki** (`moddingwiki.shikadi.net`) — the standard reference for
+  DOS game file formats, frequently with the exact level, sprite, sound or
+  archive container already described.
+- **GitHub and GitLab** for existing extractors, loaders, ports or
+  decompilations, and their issue trackers, where the hard parts get discussed.
+- **Fan and preservation communities** — VOGONS, MobyGames, the author's own
+  site if it survives, and any interview where they describe how it was built.
+
+Treat everything found as a **hypothesis to check against the binary, not a
+fact**. Third-party notes are usually right about the broad shape and wrong in
+the details, and a format description that is ninety per cent right costs more
+than no description at all if it is trusted. Verify each claim against the
+bytes, and record in `docs/` which claims you confirmed and which you inherited
+unverified — those are different kinds of knowledge and must not blur.
+
+**Source dumps: naming and organisation only.** Leaked or unofficial source may
+exist. The reconstruction must stay **clean-room**, so:
+
+- Use it **only** for names and organisation — what a routine was called, how
+  the original was split into files, what a struct field meant. A good name is
+  worth having and is not the work.
+- **Never** for reconstructing a function's logic, structure or algorithm. The
+  C must come from the disassembly you read. If you have seen source for a
+  routine, transcribe that routine from the bytes and check it against the
+  emulator exactly as you would any other — the disassembly is the source of
+  truth, not the leak.
+- **Mark the provenance** of anything borrowed, so it can be scrubbed if the
+  project's standard tightens later.
+- Know that this is a pragmatic middle, not the strict standard: a true
+  clean-room process has no exposure at all. If legal defensibility ever
+  matters more than convenience, name from the binary's own evidence instead.
+- **Officially released source under a licence is a different situation** —
+  read the licence. Working from it may be perfectly allowed, but it makes the
+  project a port of that source rather than a reverse-engineering one, which is
+  a different claim to make about the result.
+
+**2. Recover the executable, and prove the recovery.**
+Most DOS-era binaries are packed (EXEPACK, LZEXE, PKLITE). Run the unpacking
+stub under an emulator rather than reimplementing it — stubs rely on real 8086
+behaviour, notably the 1 MB address wrap, so load at a high segment to
+reproduce it. Then *prove* it: round-trip the emitted EXE against the stub's
+own output. An unpack that is subtly wrong poisons everything downstream and
+looks like a hundred transcription bugs.
+
+**3. Identify what it was built with, and record it.**
+Do this immediately after unpacking, before transcribing anything, because the
+answer changes what "done" can mean.
+
+The fastest single test is the **function prologue**: count `push bp / mov
+bp,sp`. Compiled C has one at nearly every function; *zero* across a whole code
+segment means hand-written assembly. Then look for:
+
+- **Compiler banner strings**, which are usually left in the binary verbatim —
+  `Turbo-C - Copyright (c) 19xx Borland Intl.`, `Borland C++ - Copyright`,
+  Microsoft C's startup and `_matherr` strings, Watcom's `WATCOM` markers,
+  Turbo Pascal's runtime error text.
+- **Calling convention** — arguments pushed right-to-left and cleaned by the
+  caller is cdecl, so C. Arguments passed in registers and threaded across
+  calls is a person.
+- **Memory model** — the mix of near and far calls, and how the segment
+  registers are set up, distinguishes tiny/small/compact/medium/large/huge.
+- **Runtime library fingerprints** — `printf` format machinery, `__ctype`
+  tables, the floating-point emulator, a stack-check routine at the head of
+  every function, an overlay manager (Borland's VROOMM). Library-signature
+  matching (FLIRT-style) will name the exact runtime version if you have it.
+- **Linker and packer artifacts** — Microsoft `LINK /E` produces EXEPACK, and
+  LZEXE and PKLITE each have their own stub, which dates the toolchain.
+
+**Why it matters later.** If the game was *compiled*, byte-exact reconstruction
+from source is on the table: write C, compile it with the **same compiler,
+version, memory model and optimisation flags** under DOSBox, and diff the
+output against the original. That is the "matching decompilation" standard, and
+it is a far stronger result than behavioural equivalence — the proof is the
+bytes, not a test. It also changes how you transcribe *now*: knowing the
+compiler tells you which idioms in the disassembly are the compiler's rather
+than the author's, so you do not carefully preserve register-shuffling that was
+never a decision anyone made.
+
+If it is **hand-written assembly**, matching is not meaningfully available.
+Behavioural equivalence through differential verification is the standard, and
+every instruction is a decision someone made and worth reading as one.
+
+Either way, put the finding and the evidence for it in `docs/` — and say which
+world you are in near the top of `STATUS.md`, because it sets what the project
+is aiming at.
+
+**4. Map the code before reading it.**
+Hand-written assembly desynchronises a linear disassembly constantly — data
+sits between routines, and jumps land mid-instruction. Use recursive descent
+from the entry point, **seeded with every handler table the game dispatches
+through**. Finding those tables is the single highest-leverage early task: a
+game's entity handlers, its cell-value handlers, its menu keys. Everything the
+tables reach is code; everything else is suspect.
+
+**5. Build the emulator in layers, and keep them separate.**
+
+```
+DOS/BIOS shim  ->  video + input + timing  ->  window / driver
+```
+
+The generic layers are not written fresh for each game — they live upstream in
+`dos_emulator` and are **subclassed** locally. See *The shared toolchain* below.
+
+Make the bottom layer **read-only on the host filesystem**: serve reads from
+the real game directory, satisfy writes from an in-memory overlay. That single
+guarantee means every experiment is safe — you can let the game save, let the
+level editor write files, and never touch the originals. New behaviour goes in
+the *top* layer. Weakening the read-only guarantee to add a feature destroys
+the reason it exists.
+
+**6. Transcribe as structured C that reads as a game.**
+Not transliterated register-shuffling. Every routine carries the address it was
+read from (`seg:off`) as a comment, so any line can be argued back to a byte in
+the binary. Where a routine genuinely cannot be written honestly as structured
+C, write it literally and say why.
+
+**Always use `stdint` types, without exception** — `uint8_t`, `uint16_t`,
+`uint32_t`, `int16_t`, `int32_t`. Never `unsigned`, `unsigned char`, `short` or
+`long`. `char` stays `char` for actual strings (paths, `printf`).
+
+This is not a style preference. It is 16-bit assembly, where every value has a
+width the original depended on: `int16_t` says "this truncation is the `imul`'s"
+in a way `short` does not, `unsigned` hides whether a thing is a byte, a word or
+a register holding one, and a bare `int` says nothing at all. The widths are
+usually identical on a modern ABI, so getting this wrong compiles and runs and
+silently loses the one fact the type was carrying.
+
+Write this rule into the project's `CLAUDE.md` at the start — see *What goes
+where* below. It is the convention most likely to be quietly dropped once the
+original context is gone.
+
+**7. Verify differentially, per routine.**
+Stop the emulator at a routine's entry, capture the machine, let the
+**original** body run to its return, capture again. Run the C on the first
+capture and diff: image, video memory, registers, return value.
+
+This needs no determinism to mean anything — it compares the C and the original
+on *the same call inside one run*, so the host clock and the game's RNG cannot
+make it flaky.
+
+**8. Lockstep the whole program.**
+Run port and emulator side by side, syncing at one point in the main loop, and
+compare video memory byte for byte every frame.
+
+The trap: a sync point in the play loop compares **only** the play loop. Level
+intros, results screens, endings and menus have loops of their own and are
+compared by *nothing at all*. Add opt-in sync points for each. Bugs live for
+months on screens no run can see.
+
+## Coverage is where self-deception lives
+
+Track two different numbers and never conflate them:
+
+- **transcribed** — the routine exists in C
+- **verified** — the original has actually been run against it
+
+A routine transcribed and never wired into the checker looks finished in the
+notes and has never executed. Also separate *proven* (ran, did work, agreed)
+from *agreed but every call was an early return* — the second is not evidence.
+
+And note that a routine whose **caller** is being sampled is never sampled
+itself, so a naive pass reports as unchecked a great many routines it ran
+straight past. Chase callers explicitly.
+
+## Reaching the state is the actual skill
+
+Most of what is wrong in a port is in code no run ever executed. Getting a
+routine to run at all is most of the work. In rough order of preference:
+
+- **Stop on a rule, not a frame.** "Stop the first time execution reaches this
+  routine" is reproducible on another machine and after the scratchpad is
+  cleared. "Run for 4 seconds and hope" is not.
+- **Poke to fast-forward, not to fake.** Clearing the brick count is what the
+  play loop already watches for, so the game runs its own level-done path from
+  there. The state is the game's own, only sooner.
+- **Bias the RNG tables.** A 7-in-255 outcome is never reached by playing. Zero
+  the cumulative weights up to the wanted entry and it comes out every time —
+  and because the poke lives in the snapshot, *both sides see the same table*,
+  so the comparison stays as honest as any other.
+- **Chain snapshots.** Reach a state in stages and capture each one; a check
+  that starts *at* a screen beats one that plays to it for two minutes.
+- **Drive input from the guest's own cue.** Wall-clock key scripts miss,
+  because emulator speed varies with what the guest is doing — the same script
+  reaches a screen on one run and misses on the next. Trigger on a code offset
+  ("press F1 when execution reaches the menu's key read"), or on the guest
+  having drained the keyboard buffer and come back for more.
+
+## Timing
+
+**Measure the original, in cycles.** Not the port in wall clock — that only
+says how fast its own sleeps run — and not by adding up the delay loops, which
+misses everything they do not cover. Hook every instruction under the emulator
+and sum a real cycle table (the iAPX 86/88 manual's, for 8086). Report the
+mnemonics the table could not cost so coverage of the estimate is visible.
+
+**Watch for compensation loops.** A game may spend N empty loops and then take
+most of them *back* when it did some real work, so both branches cost the same.
+If the port does that work for free in native code, it only ever runs the cheap
+branch and comes out far too fast. This is easy to miss and hard to see.
+
+Once the rate is known, pace on an **absolute clock**, not on emulated delays.
+A sleep of a fraction of a millisecond is at the mercy of the host scheduler,
+which makes the game's speed a property of the machine rather than of the game.
+
+## Traps that cost real time
+
+- **When an instrument disagrees with an established fact, suspect the
+  instrument first.** Reading an *image* offset in a *file* forgets the EXE
+  header in front of it; the resulting garbage looks exactly like a discovery.
+  Confirm against the loaded image before rewriting a doc.
+- **Calibrating against the port measures the port.** See timing above.
+- **A stale output file reads as a successful run.** Delete the target before a
+  capture, and check the exit status — a crashed run leaves yesterday's file
+  sitting there looking plausible.
+- **Check the baseline before diagnosing a failure.** If a comparison fails
+  after a change, rebuild at the previous commit and run the *same* check. Half
+  the time the divergence was already there and belongs to someone else.
+- **Know your file formats.** `--shot` writing BMP while named `.png` wastes a
+  cycle; so does assuming a scan code is decimal when it is parsed as hex.
+
+## What goes where
+
+Split the writing in two, or one crowds out the other:
+
+- **`docs/`** — what the program *is*: addresses, data formats, structures,
+  cell values, file layouts. Reference material, argued back to bytes.
+- **`CLAUDE.md`** — how to *work on* it: the tools, the conventions, and the
+  traps that change what you do. Long-term instructions and notes, not facts
+  about the game.
+- **`STATUS.md`** — where the port has got to, what is **proven**, and what is
+  next. See below; this one is not optional.
+
+**Record the conventions in `CLAUDE.md` early, before they are needed.** At
+minimum:
+
+- **`stdint` types only**, with the reason — the rule alone reads as fussiness
+  and gets dropped; the reason is what makes it stick.
+- addresses are image offsets unless written `seg:off`, and every transcribed
+  routine carries the one it came from
+- where a name or a type is a guess, say so
+- the port is structured C that reads as a game, checked against the emulator
+  rather than assumed
+
+These survive context loss; a decision made once in conversation does not. A
+convention that has to be re-derived is a convention that will be re-derived
+differently.
+
+Deliberate non-goals belong in the port as **no-ops with a comment saying why**,
+not as gaps waiting to be filled — and out of the verifier's dispatch, since
+comparing a no-op against the original reports a decision as a difference.
+
+## STATUS.md, and keeping it honest
+
+A port of any size outlives its context many times over. `STATUS.md` is what
+makes it possible to pick the work up cold, and it is the only place that
+distinguishes *written* from *proven*. Create it at the start, not when the
+project is big enough to need it.
+
+Three sections earn their place:
+
+- **Done** — each claim stated as what was *checked*, not what was written.
+  "Every reachable routine is transcribed" and "the transcription is checked
+  against the original, not against the screen" are two different headings, and
+  the second is the one that matters.
+- **Open** — what is known to be wrong or unproven, including the coverage
+  table *as last measured*, with the number of routines proven, shallow
+  (agreed but every call was an early return), differing, and never reached.
+- **Next** — and **Deferred**, for the things deliberately not being worked.
+
+Rules that keep it worth reading:
+
+- **Carry measured numbers, not remembered ones.** Have the sweep write the
+  coverage table into the file rather than transcribing it by hand. A figure
+  someone retyped is a figure nobody can reproduce.
+- **Date it**, and update it in the same change that makes it untrue.
+- **Record retractions.** When something claimed as proven turns out not to be
+  — the check never reached the code, or the instrument was wrong — say so in
+  the file. A status document that only ever gains claims is a marketing
+  document.
+
+## The shared toolchain: `dos_emulator`
+
+The Python tooling is **not per-game**. It lives in
+<https://github.com/borancar/dos_emulator> and is maintained across projects.
+Part of the job on any reconstruction is noticing what is generic and pushing
+it upstream, so the next game starts with a working emulator instead of a blank
+file.
+
+**What belongs upstream** — anything that does not name a specific game:
+
+- the DOS/BIOS shim: INT 21h/16h/33h, the IVT, the PSP, the read-only overlay
+- the CPU wrapper, and executable recovery (EXEPACK, LZEXE, PKLITE)
+- video: CGA/EGA/VGA modes, palettes, retrace, the text-mode renderer and its
+  code-page tables
+- input, timing, the machine snapshot format, the deterministic key driver
+- the cycle-cost model, the disassembly and code-mapping helpers, the
+  differential-verify scaffolding
+
+**What stays local** — anything keyed to one game: its memory map, routine
+names, handler tables, sync-point offsets, its bot, its level formats.
+
+**Subclass, don't fork.** Local derivations subclass the upstream classes and
+override what differs. If you find yourself copying an upstream file to change
+three lines, that is the signal that upstream is missing an extension point —
+add the hook, the optional parameter or the overridable method *there*, and
+subclass here. A forked copy stops receiving fixes the moment it is made.
+
+**Do not break what already depends on it.** Other games' repositories use this
+code, and their verification sweeps are the only thing that would catch a
+regression.
+
+- Prefer **additive** changes: new methods, new subclasses, new optional
+  parameters whose defaults preserve today's behaviour exactly.
+- Never quietly change a default that alters existing behaviour. If a
+  behavioural change is genuinely right, make it opt-in first.
+- If a signature has to change, keep the old form working.
+- **Run an existing game's verification sweep against the change before
+  pushing.** A port's lockstep run and per-routine sweep are a regression test
+  for the emulator as much as for the port — they are the closest thing this
+  toolchain has to a test suite, and they are very good at it.
+
+**Depend on it with `uv`, pinned to a commit.** This is the default; do not
+hand-roll a venv and a `requirements.txt`.
+
+```toml
+# the game repository's pyproject.toml
+dependencies = [
+  "dos-emulator @ git+https://github.com/borancar/dos_emulator@<sha>",
+  "capstone", "unicorn", "pygame-ce", "numpy",
+]
+
+[tool.uv]
+package = false          # a directory of scripts, not a package
+```
+
+`uv sync` builds the environment, `uv run tool.py ...` runs anything, and
+`uv.lock` pins *every* dependency, not just the interesting one.
+
+**Pin the emulator to a commit, and mean it.** A game repository's numbers — its
+coverage table, its measured frame rate — are measurements taken against a
+specific emulator. A measurement whose instrument cannot be named is not
+reproducible. So moving the pin is a deliberate act, and the verification sweep
+gets re-run afterwards; that is also what stops an upstream change from silently
+invalidating a figure someone is about to publish.
+
+**Reach the emulator through one local module.** Give the game repository a
+small adapter — its game directory, its unpacked executable, its code-segment
+base, and a command line that defaults to this game — and have every tool
+import the emulator *through it* rather than importing upstream directly. When
+the shared code moves underneath, there is one file to fix instead of nine.
+
+**When to extract.** Build it locally first, where the real requirements are;
+then, once it works, ask of every tool and class: *does this mention an
+address, a routine name, or the game's title?* If not, it belongs upstream —
+move it promptly rather than letting a pile of generic code accumulate in one
+game's repository, which is how the next project ends up copying files.
+
+Keep upstream's own README current as tools are added: what each one is for and
+why it exists, in the same style as the per-game `CLAUDE.md` tool table.
+
+## Repository layout: `develop`, and `master` as a subtree
+
+The work and the deliverable want different audiences, and one repository can
+serve both without mixing them.
+
+- **`develop` is the default branch and holds everything**: the emulator, the
+  disassembly tooling, the verification harness, `docs/`, `CLAUDE.md`,
+  `STATUS.md`, and the reconstruction in a subdirectory (`reconstruct/`).
+- **`master` holds only the reconstructed code**, published with
+  `git subtree`. Someone who wants to build and play the port clones it and
+  gets a small tree with no emulator, no Python, no research notes.
+
+```sh
+git push origin develop
+git subtree push --prefix=reconstruct origin master
+```
+
+Do this from the beginning. Retrofitting the split later means rewriting the
+subdirectory's history or losing it.
+
+**The reconstruction directory gets its own `README.md`**, and it is a
+different document from the repository's. The top-level one explains the
+project — the reversing, the emulator, the method. The subtree's is read by
+someone who has *only* that tree, so it must stand alone:
+
+- what it is and how to build and run it (`make && ./game`)
+- what it needs — dependencies, and where it reads the original's data from
+- **how it is known to be right**, briefly, with a link back to the `develop`
+  repository for the harness and the disassembly notes
+- **where it deviates from the original**, deliberately — the timing model, any
+  screen not transcribed, any flag removed. A reader of the subtree has no
+  `CLAUDE.md` to discover these in, so anything not written here is invisible.
+- the licence position for both works, which are not the same work: the game's,
+  and the reconstruction's
+
+Screenshots belong in this README, near the top. They are the port's own
+output, so a repository-wide `*.png` ignore needs a negation for them.
+
+## Redistribution
+
+Decide it knowingly. If the authors placed the work in the public domain, carry
+**their exact words and any condition attached** ("not for commercial use
+without prior agreement") alongside the files. A declaration in a readme is the
+authors' word about their own distribution — it is not automatically a licence
+grant you can re-publish under, and serving a binary from a web page is broader
+distribution than a git repo. When in doubt, ship the port and let it read the
+player's own copy at run time.

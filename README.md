@@ -11,6 +11,26 @@ Everything here exists to make a port provable rather than plausible.
 uv run dos-emulator GAME.EXE --scale 3
 ```
 
+## The method it serves
+
+This emulator is one part of a way of working, and the rest of it is written
+down beside it: **[`skills/dos-game-reconstruction`](skills/dos-game-reconstruction/SKILL.md)**.
+
+It is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills),
+and it is also just a document — worth reading whether or not you use Claude. It
+covers the whole arc: finding what a modding community already documented,
+recovering a packed executable and proving the recovery, identifying which
+compiler built the original (and what that means for whether a *byte-exact*
+reconstruction is possible), mapping code that a linear disassembler cannot
+follow, transcribing it, and then the part that matters most — proving each
+routine against the original rather than against the screen.
+
+To use it with Claude Code, link it into your skills directory:
+
+```sh
+ln -s "$PWD/skills/dos-game-reconstruction" ~/.claude/skills/
+```
+
 `uv sync` installs it; `python -m dos_emulator GAME.EXE` works too, and so does
 importing it, which is the point — see *Layering* below.
 
@@ -101,6 +121,7 @@ before pushing.
 | `src/dos_emulator/sb.py` | a Sound Blaster model — DSP commands, the mixer, DMA playback |
 | `src/dos_emulator/xms.py` | an XMS driver: the `INT 2Fh` hook, handles, and block moves |
 | `src/dos_emulator/__init__.py` | what a dependent project imports |
+| `skills/dos-game-reconstruction/` | the method: how to reverse a DOS game and reconstruct it, and how to prove the result |
 
 A `src/` layout on purpose: it cannot be imported from the working directory
 without installing, so a packaging mistake fails here rather than in the

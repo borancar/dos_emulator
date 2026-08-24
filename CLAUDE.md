@@ -50,6 +50,33 @@ can escape, nothing is reproducible.
 `DOS/BIOS shim → video, input, timing → the window.` New behaviour goes in the
 **top** layer that can carry it.
 
+## The skill is maintained here
+
+`skills/dos-game-reconstruction/SKILL.md` is the **canonical copy** of the
+method this emulator serves. A checkout linked into `~/.claude/skills/` is a
+symlink to it, not a fork — edit it here, and the linked copy follows.
+
+It belongs in this repository rather than in one game's, because it is about
+*all* of them, and because the emulator and the method move together: a new
+capability here usually implies a new technique there, and a technique with no
+tool to carry it out is a wish.
+
+So **update the skill in the same change that makes it stale**:
+
+- a new way to reach a state, drive input, or measure something goes in
+  *Reaching the state* or *Timing* as soon as the tool for it lands here
+- a trap that cost real time goes in *Traps that cost real time*, in the shape
+  that would have saved it — what looked true, and what it actually was
+- when the emulator gains a capability that changes what a project should do
+  (a timer interrupt, planar VGA, an unpacker), say so in the phase it belongs
+  to, not only in STATUS.md
+- keep the worked examples concrete. "Bias the RNG so a rare capsule always
+  drops" teaches; "consider adjusting randomness" does not
+
+The skill and [STATUS.md](STATUS.md) answer different questions and both are
+needed: STATUS.md is what this emulator *can do*, the skill is what to *do with
+it*. Neither substitutes for the other.
+
 ## Keep the record current
 
 **Update [STATUS.md](STATUS.md) in the same change that makes it untrue.** It is
