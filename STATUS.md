@@ -16,7 +16,7 @@ Updated 2026-08-25.
 | **POPGEN** (Popcorn's level editor) | text mode 03h, BIOS keyboard via INT 16h, INT 21h AH=19h/47h | ran unmodified the first time; its file formats were measured through it |
 | **POPSPEED** (Popcorn's speed utility) | INT 21h AX=2568h and nothing else | trivial - sets an interrupt vector and exits |
 | **Ducks** (Furnish / Hungry Software, 1998-2000) | VGA mode 13h switched to Mode X - planar writes through the map mask, the CRTC start address, the DAC; Sound Blaster 8-bit auto-init DMA on IRQ 5; XMS; the BIOS keyboard and port 0x60; INT 33h mouse; the control socket | the project the VGA, Sound Blaster, XMS, directory-service and control-socket code come from. Rebased onto this emulator on 2026-08-25: its own port's checks ran unchanged through it - the snapshot-replay comparison of its natives against the original, and its C-against-guest tests - and `Ducks.unpacked.exe` runs here from the README through the splash to the menu and its demo level, with the DAC, planar and DMA paths live. See the Ducks repository's STATUS.md for the numbers |
-| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, and an interrupt gate that clears TF - the game single-steps itself to decrypt its own code | start-up only, as of 2026-08-25: it clears both machine-type menus, enters BIOS mode 0Dh and opens `main.dat` and `adlib.dat`. **Nothing is drawn** - mode 0Dh is not rendered (see *Known gaps*) - and no routine has been transcribed or checked |
+| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, an interrupt gate that clears TF (the game single-steps itself to decrypt its own code), the INT 1Eh diskette parameter table, INT 13h, and INT 21h AH=1Bh | as of 2026-08-25 it clears both machine-type menus, passes its copy protection, and runs on into the game proper - setting mode 10h and writing 496 DAC entries. **Nothing is rendered**: the 16-colour planar modes have no framebuffer decode (see *Known gaps*). No routine has been transcribed or checked |
 | **PickEggs** (Ducks' egg selector) | text mode 03h, INT 21h AH=1Ah/3Bh/47h/4Eh/4Fh - a directory browser | its file-operation log and its screen came out byte-identical to the Ducks project's own emulator on 2026-08-25 |
 
 Popcorn is the reason most of this exists, and it is why the CGA and PC-speaker
@@ -102,6 +102,14 @@ level editor, and nothing on disk changes.
   there rather than assuming one, and then polls base+6 - PC Lemmings does
   exactly that, and with 0040:0063 left at zero it polled *port 6* twenty-six
   million times waiting for a bit that could never arrive
+
+- **INT 21h AH=1Bh/1Ch**, allocation info for a drive: sectors per cluster,
+  bytes per sector, cluster count, and DS:BX pointing at the media descriptor
+  byte - 0xF8 for a fixed disk. The media byte is the point of the call, and
+  left unhandled the caller reads whatever DS:BX held. PC Lemmings' copy
+  protection asks; with a stale answer it took the wrong branch, never opened
+  its own run counter, ran a floppy check that cannot pass on a machine with
+  no floppy, and quit with "Lemmings Disk 1 Not found"
 
 ### Disk (INT 13h)
 

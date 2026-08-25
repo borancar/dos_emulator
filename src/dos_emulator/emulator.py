@@ -91,6 +91,8 @@ ENV_SEG = 0x00F0
 # here rather than at code. IBM's values for a 1.44 MB drive; offset 3 is
 # bytes-per-sector (2 = 512) and offset 4 sectors-per-track, which is what a
 # disk-based protection rewrites before reading a non-standard track.
+# One byte of scratch for INT 21h AH=1Bh/1Ch to point DS:BX at.
+MEDIA_ID_ADDR = 0xFEFE0
 DPT_ADDR = 0xFEFC7
 DPT = (0xDF, 0x02, 0x25, 0x02, 0x12, 0x1B, 0xFF, 0x6C, 0xF6, 0x0F, 0x08)
 
@@ -735,6 +737,24 @@ class DosMachine:
             return
         if ah == 0x19:
             self._set(UC_X86_REG_AX, 2)          # drive C:
+            return
+        if ah in (0x1B, 0x1C):
+            # Allocation info for the default drive (1Bh) or the drive in DL
+            # (1Ch): AL sectors per cluster, CX bytes per sector, DX clusters,
+            # and DS:BX pointing at the media descriptor byte.
+            #
+            # The media byte is the point of the call for anything that cares:
+            # 0xF8 is a fixed disk, 0xF9/0xFD/0xFF are floppies. PC Lemmings'
+            # copy protection asks, and left unhandled it read whatever DS:BX
+            # happened to hold. This answers as the hard disk the guest is in
+            # fact running from.
+            self.uc.mem_write(MEDIA_ID_ADDR, bytes([0xF8]))
+            self._set(UC_X86_REG_AX,
+                      (self._reg(UC_X86_REG_AX) & 0xFF00) | 0x04)
+            self._set(UC_X86_REG_CX, 512)
+            self._set(UC_X86_REG_DX, 0x4000)
+            self.uc.reg_write(UC_X86_REG_DS, MEDIA_ID_ADDR >> 4)
+            self._set(UC_X86_REG_BX, MEDIA_ID_ADDR & 0x0F)
             return
         if ah == 0x1A:
             self.dta = (ds, dx)
