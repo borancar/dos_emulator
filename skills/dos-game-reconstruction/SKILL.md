@@ -286,6 +286,35 @@ The same goes for transcribed *data* — a palette, a jump table, a string table
 lifted out of the executable is as much a transcription as a routine, and takes
 the same comment.
 
+**The game's file holds the game, and nothing else.** The port's `.c` files
+mirror the original's translation units — that is the only division of the
+program its authors made. So a file named after the game holds *transcribed
+routines*, and everything the original did not contain goes in the boundary
+file the port chose: the window, input, timing, file writing, the command line,
+test scaffolding, memory helpers.
+
+A function marked "the port's own" **inside the game's file is a smell**. It
+means one of two things, and both need acting on:
+
+- it is **IO** — it replaces something the original did through the BIOS, the
+  EGA or a disk interrupt — and belongs in the boundary file; or
+- it is **game logic you wrote yourself instead of transcribing**, which is
+  the thing this whole method exists to avoid.
+
+**Default to transcribing.** If a routine does something the original does, go
+and find it and read it, rather than writing a version that behaves the same.
+The two are not equivalent: a behavioural match is only as good as the states
+you happened to compare, and this port has repeatedly shipped a plausible
+routine that agreed with every capture and was still wrong — a compositing rule
+fitted to four screens, a sprite index whose sign only mattered at values
+nothing could reach, an object placement sixteen pixels out that no comparison
+covered. Writing your own is right for **IO and nothing else**.
+
+The practical test when you are about to write a helper: *does the original
+have to do this too?* If yes, it has a routine for it — find the routine. If it
+is only necessary because you are on a modern machine with a window and a
+filesystem, it is the port's, and it goes in the port's file.
+
 **Enforce it with a check, because saying it is not enough.** The PC Lemmings
 port states this convention in its `CLAUDE.md`, in the very words above, and
 then decayed anyway: audited after a long session, **13 functions carried an
