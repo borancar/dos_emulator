@@ -256,6 +256,17 @@ This needs no determinism to mean anything — it compares the C and the origina
 on *the same call inside one run*, so the host clock and the game's RNG cannot
 make it flaky.
 
+**Compare against what the original *composes*, not only what it displays.**
+A screen carries sprites, a cursor, a palette fade, a scroll offset and a
+viewport; every one of those is a difference that is not the difference you
+are looking for. A game that builds a level, a map or a sheet in memory before
+showing it gives you something far better: break at the instruction *after*
+the loop that builds it - that is the exact moment it is complete - and dump
+the buffer. Then the comparison is two programs' data, with no presentation in
+it at all. For PC Lemmings this took the check from "81% of a screen, and here
+are nine hypotheses about the rest" to "100.00% of 49,741 terrain pixels", and
+it was the same port both times.
+
 **8. Lockstep the whole program.**
 Run port and emulator side by side, syncing at one point in the main loop, and
 compare video memory byte for byte every frame.
@@ -340,6 +351,18 @@ which makes the game's speed a property of the machine rather than of the game.
 
 ## Traps that cost real time
 
+- **A "known gap" you argued away is the most expensive kind.** Writing a gap
+  down is not the same as bounding it, and an argument for why it cannot
+  matter is exactly the thing to distrust. This emulator listed "reads of
+  planar memory return flat memory" as a gap and dismissed it because the
+  game's blitter appeared to discard the value it read. It did not: two
+  instructions later that value became the Graphics Controller's bit mask, so
+  the read *was* the game's "do not overwrite" test. The result had the right
+  shape and the wrong colours, looked plausible on screen, and was attributed
+  to the reimplementation for several rounds while hypotheses about the port
+  were tested and rejected one after another. **When a difference survives
+  every hypothesis about the thing you are checking, start doubting the thing
+  you are checking it against.**
 - **Check the reference against a second reference before believing a score.**
   A comparison that lands near its own noise floor is more often a broken
   instrument than a broken result. PC Lemmings' level scored 59.59% against
