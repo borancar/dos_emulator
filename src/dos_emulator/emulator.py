@@ -336,6 +336,20 @@ class DosMachine:
         self.uc.reg_write(UC_X86_REG_DX, self.psp_seg)
         self.start = (self.load_seg + cs) * 16 + ip
 
+        # Where INT 21h AH=48h hands memory out from: just above the program,
+        # rounded up, and running to the usual 640K line. Real DOS on a 640K
+        # machine offers a program most of that, and a program that asks how
+        # much there is and sizes its buffers accordingly needs a believable
+        # answer.
+        img_paras = (len(image) + 15) // 16
+        arena = (self.load_seg + img_paras + minalloc + 0x10) & ~0x0F
+        self.mem_top = 0x9FFF
+        if arena >= self.mem_top:
+            arena = self.load_seg + img_paras + 0x10
+        # One free block covering everything above the program, up to the
+        # usual 640K line. `arena` blocks are (segment, paragraphs, in_use).
+        self.arena = [[arena, self.mem_top - arena, False]]
+
     # ----------------------------------------------------------------- utils
     @staticmethod
     def device_info(handle):
@@ -491,6 +505,80 @@ class DosMachine:
         if intno == 0x33:
             return self._mouse()
         self._note(f"unhandled INT {intno:02x}h AX={self._reg(UC_X86_REG_AX):04x}")
+
+    def _mem_coalesce(self):
+        """Merge neighbouring free blocks, so a freed block can be reused."""
+        self.arena.sort(key=lambda b: b[0])
+        out = []
+        for b in self.arena:
+            if out and not out[-1][2] and not b[2] \
+                    and out[-1][0] + out[-1][1] == b[0]:
+                out[-1][1] += b[1]
+            else:
+                out.append(b)
+        self.arena = out
+
+    def _mem_largest(self):
+        return max((b[1] for b in self.arena if not b[2]), default=0)
+
+    def _mem_alloc(self, paras):
+        """First fit, splitting the block. None if it will not fit.
+
+        A real allocator matters more than it looks. This used to answer
+        segment 0x8000 for every call whatever the size, so a program that
+        allocated twice got two names for the same memory. PC Lemmings
+        allocates 0x5ad8 paragraphs, frees it, and allocates 0x5571 - which
+        only works if a free actually gives the memory back.
+        """
+        if paras == 0xFFFF or paras == 0:
+            return None
+        for b in self.arena:
+            if not b[2] and b[1] >= paras:
+                seg = b[0]
+                if b[1] > paras:
+                    self.arena.append([seg + paras, b[1] - paras, False])
+                b[1] = paras
+                b[2] = True
+                self.blocks += 1
+                self._mem_coalesce()
+                return seg
+        return None
+
+    def _mem_free(self, seg):
+        for b in self.arena:
+            if b[0] == seg and b[2]:
+                b[2] = False
+                self._mem_coalesce()
+                return True
+        return False
+
+    def _mem_resize(self, seg, paras):
+        """None on success; otherwise the largest this block could become."""
+        for i, b in enumerate(self.arena):
+            if b[0] != seg or not b[2]:
+                continue
+            if paras <= b[1]:                       # shrink: give the tail back
+                if paras < b[1]:
+                    self.arena.append([seg + paras, b[1] - paras, False])
+                    b[1] = paras
+                    self._mem_coalesce()
+                return None
+            nxt = next((x for x in self.arena
+                        if x[0] == seg + b[1] and not x[2]), None)
+            avail = b[1] + (nxt[1] if nxt else 0)
+            if paras <= avail:
+                take = paras - b[1]
+                nxt[0] += take
+                nxt[1] -= take
+                b[1] = paras
+                if nxt[1] == 0:
+                    self.arena.remove(nxt)
+                self._mem_coalesce()
+                return None
+            return avail
+        # Not one of ours - the program's own block from the loader. Accept a
+        # shrink, which is what a C runtime does at startup.
+        return None
 
     def _bios_disk(self):
         """INT 13h, as a PC with drives fitted but no diskette in them.
@@ -818,9 +906,44 @@ class DosMachine:
             self._set(UC_X86_REG_CX, 512)
             self._set(UC_X86_REG_DX, 40000)
             return
-        if ah in (0x48,):
-            self._set(UC_X86_REG_AX, 0x8000)
-            self._set(UC_X86_REG_BX, 0x1000)
+        if ah == 0x48:
+            want = self._reg(UC_X86_REG_BX) & 0xFFFF
+            seg = self._mem_alloc(want)
+            if seg is None:
+                # The documented way to ask "how much is there?" is to ask for
+                # more than exists and read BX out of the failure.
+                self._cf(True)
+                self._set(UC_X86_REG_AX, 8)          # insufficient memory
+                self._set(UC_X86_REG_BX, self._mem_largest())
+                self._fop(f"ALLOC {want:#x} paragraphs REFUSED, "
+                          f"{self._mem_largest():#x} free")
+                return
+            self._set(UC_X86_REG_AX, seg)
+            self._cf(False)
+            self._fop(f"ALLOC {want:#x} paragraphs -> {seg:04x} "
+                      f"({self._mem_largest():#x} largest free)")
+            return
+        if ah == 0x49:
+            blk = self.uc.reg_read(UC_X86_REG_ES) & 0xFFFF
+            if self._mem_free(blk):
+                self._cf(False)
+                self._fop(f"FREE {blk:04x} "
+                          f"({self._mem_largest():#x} largest free)")
+            else:
+                self._cf(True)
+                self._set(UC_X86_REG_AX, 9)          # bad block address
+                self._fop(f"FREE {blk:04x} -> NOT A BLOCK")
+            return
+        if ah == 0x4A:
+            blk = self.uc.reg_read(UC_X86_REG_ES) & 0xFFFF
+            want = self._reg(UC_X86_REG_BX) & 0xFFFF
+            got = self._mem_resize(blk, want)
+            if got is None:
+                self._cf(False)
+            else:
+                self._cf(True)
+                self._set(UC_X86_REG_AX, 8)
+                self._set(UC_X86_REG_BX, got)
             return
         if ah == 0x43:
             # Get/set file attributes. Blindly reporting success told the
@@ -844,7 +967,7 @@ class DosMachine:
             return
         # 0x44 was in this list, which is why the answer below never ran: an
         # accepted-and-ignored call leaves DX holding whatever it held before.
-        if ah in (0x49, 0x4A, 0x33, 0x38, 0x0B, 0x62):
+        if ah in (0x33, 0x38, 0x0B, 0x62):
             if ah == 0x62:
                 self._set(UC_X86_REG_BX, self.psp_seg)
             if ah == 0x0B:

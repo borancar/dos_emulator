@@ -130,6 +130,20 @@ level editor, and nothing on disk changes.
   its own run counter, ran a floppy check that cannot pass on a machine with
   no floppy, and quit with "Lemmings Disk 1 Not found"
 
+- **A real memory allocator.** INT 21h AH=48h/49h/4Ah keep a block list above
+  the loaded program up to the 640K line: first fit, splitting on allocate,
+  coalescing on free, and a resize that can grow into an adjacent free block.
+  Asking for 0xFFFF paragraphs fails with the largest available in BX, which
+  is how a program asks how much memory there is.
+
+  This replaced an AH=48h that answered segment **0x8000 for every call**,
+  whatever size was asked for, with AH=49h accepted and ignored. A program
+  that allocated twice got two names for one block and quietly scribbled over
+  itself. PC Lemmings allocates 0x5ad8 paragraphs, frees it, allocates 0x567,
+  frees that, then allocates 0x5571 - 744 KB in total, which only fits because
+  it hands memory back. With the old code its three buffers overlapped: its
+  skill panel drew as mottled noise, and its level came out subtly wrong.
+
 ### Disk (INT 13h)
 
 - reset, status, read, write, verify, format, drive parameters, disk type and
