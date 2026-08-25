@@ -91,6 +91,36 @@ ENV_SEG = 0x00F0
 # here rather than at code. IBM's values for a 1.44 MB drive; offset 3 is
 # bytes-per-sector (2 = 512) and offset 4 sectors-per-track, which is what a
 # disk-based protection rewrites before reading a non-standard track.
+# A tiny ROM of real 8086 code for the vectors a program may CHAIN to rather
+# than merely call. A vector left at 0000:0000 is fine while every interrupt is
+# intercepted by the emulator's own hook - but a program that saves the old
+# vector and jumps to it needs instructions there. PC Lemmings' timer handler
+# does exactly that: it does its own work on every fourth tick and jumps to the
+# saved INT 08h on the other three, which with a zero vector executed the
+# interrupt vector table as code.
+BIOS_STUB_SEG = 0xF100
+# INT 08h: bump the BIOS tick count at 0040:006C, call INT 1Ch, send the PIC an
+# end-of-interrupt, return.
+BIOS_INT08_OFF = 0x0000
+BIOS_INT08 = bytes((
+    0x1E,                    # push ds
+    0x50,                    # push ax
+    0xB8, 0x40, 0x00,        # mov ax, 0x0040
+    0x8E, 0xD8,              # mov ds, ax
+    0xFF, 0x06, 0x6C, 0x00,  # inc word [0x6c]
+    0x75, 0x04,              # jnz +4
+    0xFF, 0x06, 0x6E, 0x00,  # inc word [0x6e]
+    0xCD, 0x1C,              # int 0x1c
+    0xB0, 0x20,              # mov al, 0x20
+    0xE6, 0x20,              # out 0x20, al
+    0x58,                    # pop ax
+    0x1F,                    # pop ds
+    0xCF,                    # iret
+))
+# A bare IRET, for vectors whose default is to do nothing at all.
+BIOS_IRET_OFF = 0x0040
+BIOS_IRET = bytes((0xCF,))
+
 # One byte of scratch for INT 21h AH=1Bh/1Ch to point DS:BX at.
 MEDIA_ID_ADDR = 0xFEFE0
 DPT_ADDR = 0xFEFC7
@@ -253,6 +283,15 @@ class DosMachine:
         #
         # The table goes where a real BIOS keeps it, F000:EFC7, and the values
         # are IBM's for a 1.44 MB drive.
+        # The stub ROM, and the vectors that point into it. INT 1Ch is the
+        # user timer tick and its default really is a bare IRET.
+        self.uc.mem_write(BIOS_STUB_SEG * 16 + BIOS_INT08_OFF, BIOS_INT08)
+        self.uc.mem_write(BIOS_STUB_SEG * 16 + BIOS_IRET_OFF, BIOS_IRET)
+        self.uc.mem_write(0x08 * 4,
+                          struct.pack("<HH", BIOS_INT08_OFF, BIOS_STUB_SEG))
+        self.uc.mem_write(0x1C * 4,
+                          struct.pack("<HH", BIOS_IRET_OFF, BIOS_STUB_SEG))
+
         self.uc.mem_write(DPT_ADDR, bytes(DPT))
         self.uc.mem_write(0x1E * 4, struct.pack("<HH", DPT_ADDR & 0x0F,
                                                 DPT_ADDR >> 4))
@@ -1311,6 +1350,7 @@ class VgaDos(DosMachine):
         # there means the program's own handler is live; see
         # guest_owns_keyboard().
         self.boot_int09 = (0, 0)
+        self.boot_int08 = (0, 0)
         # Set when a console-input call rewound IP and stopped the slice
         # because no key was waiting. The pacer must not charge that slice a
         # full chunk of instruction time: nothing ran.
@@ -1327,6 +1367,12 @@ class VgaDos(DosMachine):
         # The game programs mode 3, writes the divisor low byte then high, and
         # opens the gate; sound_tick at 1ac2:0097 then rewrites the divisor
         # per note.
+        # PIT channel 0 - the timer interrupt. 0 means the full 65536, the
+        # 18.2 Hz a PC ticks at until something reprograms it.
+        self.pit0_div = 0
+        self.pit0_phase = 0
+        self.pit0_next = None
+        self.timer_ticks = 0
         self.spk_div = 0
         self.spk_gate = 0
         self.spk_playing = None
@@ -1362,6 +1408,7 @@ class VgaDos(DosMachine):
         # exists, since it lives in emulated memory.
         self.uc.mem_write(XMS_STUB_SEG * 16, bytes([0xCD, XMS_INT, 0xCB]))
         self.boot_int09 = self._ivt(0x09)
+        self.boot_int08 = self._ivt(0x08)
         if TRACE_TEXT:
             self.uc.hook_add(UC_HOOK_MEM_WRITE, self._on_textwrite,
                              None, 0xB8000, 0xB8FA0)
@@ -1476,8 +1523,20 @@ class VgaDos(DosMachine):
             self.cga_colour = v
         elif port == 0x43:
             self.pit_latch_toggle[(v >> 6) & 3] = 0
+            if (v >> 6) & 3 == 0:
+                self.pit0_phase = 0
         elif port == 0x40:
             self.pit_initial = v | (self.pit_initial & 0xFF00)
+            # Channel 0 is the timer interrupt. Its divisor arrives low byte
+            # then high; a divisor of 0 means the full 65536, which is the
+            # 18.2 Hz a PC ticks at when nothing has reprogrammed it.
+            if self.pit0_phase == 0:
+                self.pit0_div = (self.pit0_div & 0xFF00) | v
+                self.pit0_phase = 1
+            else:
+                self.pit0_div = (self.pit0_div & 0x00FF) | (v << 8)
+                self.pit0_phase = 0
+                self.pit0_next = None
         elif port == 0x42:                    # PIT channel 2: the speaker
             # Two writes, low byte then high, tracked by the same latch
             # toggle the reads use. speaker_on at 1ac2:0085 programs mode 3
@@ -1677,6 +1736,43 @@ class VgaDos(DosMachine):
             # an instruction, and a poller sees only key-ups. Hold a press
             # for some frames, as --keys and the control socket do.
             self.last_scancode = code
+
+    def service_timer(self):
+        """Deliver IRQ 0 as INT 08h when the programmed interval has elapsed.
+
+        A great many DOS games pace on this rather than on the vertical
+        retrace, and one that does simply will not run without it: PC Lemmings
+        installs a handler at image 0x04c47 and drives its whole front end and
+        game loop from it.
+
+        Paced on the wall clock, like the retrace bit, so the guest runs at
+        about the rate it was written for however fast the host is. Only one
+        tick is delivered per call and only with interrupts enabled - the
+        handler must reach its IRET before the next arrives, exactly as the
+        hardware would sequence them, and the interrupt gate having cleared IF
+        is what stops it being re-entered.
+        """
+        if not self.guest_owns_timer():
+            return False
+        if not (self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200):
+            return False
+        div = self.pit0_div or 0x10000
+        period = div / PIT_HZ
+        now = self._elapsed()
+        if self.pit0_next is None:
+            self.pit0_next = now + period
+            return False
+        if now < self.pit0_next:
+            return False
+        # Never try to catch up: a slow host would otherwise spend the whole
+        # chunk in the handler and the guest would make no progress at all.
+        self.pit0_next = now + period
+        self.timer_ticks += 1
+        return self._dispatch_to_guest(0x08)
+
+    def guest_owns_timer(self):
+        """True while the program's own INT 08h handler is installed."""
+        return self._ivt(0x08) != self.boot_int08
 
     def service_keyboard(self):
         """Deliver one queued scan code as IRQ 1, if the guest can take it.
@@ -2815,6 +2911,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                 addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
                 m.service_sound()
                 m.service_keyboard()
+                m.service_timer()
                 addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
             if audio is not None:
                 audio.push(m.sb)

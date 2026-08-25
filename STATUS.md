@@ -137,6 +137,23 @@ level editor, and nothing on disk changes.
   told its 24 sector reads had worked, checked the uninitialised buffer it had
   been handed, disbelieved it and quit
 
+### Timer
+
+- **PIT channel 0 drives INT 08h** at the divisor the program writes to ports
+  0x43/0x40, paced on the wall clock so the guest runs at about the rate it
+  was written for. One tick per service call and only with interrupts enabled,
+  so a handler reaches its IRET before the next arrives; ticks are never
+  caught up, because a slow host would otherwise spend the whole chunk in the
+  handler. PC Lemmings drives its entire front end and game loop from this
+- **a real INT 08h handler exists in a stub ROM** at F100:0000, bumping the
+  BIOS tick count at 0040:006C, calling INT 1Ch and sending the PIC an
+  end-of-interrupt. That matters because a program may *chain* to the old
+  vector rather than replace it: PC Lemmings' handler does its own work on
+  every fourth tick and jumps to the saved INT 08h on the other three, and
+  with the usual 0000:0000 vector that executed the interrupt vector table as
+  code and hung the game with a black screen. INT 1Ch points at a bare IRET,
+  which is its real default
+
 ### Input
 
 - a **hardware** keyboard: programs that install their own INT 09h and read
@@ -183,8 +200,10 @@ on before pressing replaced the wall-clock scripts that missed.
   geometry only too. It was not - the Mode X model had been carried from Ducks
   all along, unexercised, and the note was written from a belief rather than
   from the code.)
-- **No PIT channel 0 timer interrupt.** Nothing has needed INT 08h yet. A game
-  that paces on it rather than on retrace will not run.
+- **The PIC is not modelled.** The timer and keyboard interrupts are delivered
+  directly and an end-of-interrupt written to port 0x20 is accepted and
+  ignored; there is no in-service register, no mask, and no priority. Nothing
+  has needed more yet.
 - **INT 10h covers what two text-mode programs and one VGA game asked for** -
   see *Video*. No 13h (write string), no 1Ah/1Bh, and a program that reads
   the DAC back (10h/15h, 10h/17h) gets nothing. (Until 2026-08-25 this entry
