@@ -87,6 +87,13 @@ MEM_SIZE = 0x200000
 PSP_SEG = 0x0100
 ENV_SEG = 0x00F0
 
+# The Diskette Parameter Table, and where a real BIOS keeps it. INT 1Eh points
+# here rather than at code. IBM's values for a 1.44 MB drive; offset 3 is
+# bytes-per-sector (2 = 512) and offset 4 sectors-per-track, which is what a
+# disk-based protection rewrites before reading a non-standard track.
+DPT_ADDR = 0xFEFC7
+DPT = (0xDF, 0x02, 0x25, 0x02, 0x12, 0x1B, 0xFF, 0x6C, 0xF6, 0x0F, 0x08)
+
 DOS_FN = {
     0x00: "terminate", 0x02: "write char", 0x06: "direct console I/O",
     0x09: "write string", 0x0B: "check stdin", 0x0C: "flush+read",
@@ -191,6 +198,7 @@ class DosMachine:
         self.find_seq = 0
         self.finished = None
         self.blocks = 0
+        self.disk_status = 0x00   # last INT 13h status, for AH=01h
         self.video_modes = []
         self.hooked_vectors = {}
         self.guest_dispatch = Counter()
@@ -227,6 +235,25 @@ class DosMachine:
         # does exactly that, and with this left at 0 it spun on port 6 for
         # tens of millions of reads waiting for a bit that could never arrive.
         self.uc.mem_write(0x463, struct.pack("<H", 0x03D4))
+
+        # INT 1Eh is not a routine but a *pointer to the Diskette Parameter
+        # Table* - eleven bytes the BIOS reads before every floppy operation.
+        # Real hardware always has one; leaving the vector at zero makes a
+        # program that follows it read and write the interrupt vector table
+        # instead, which is silent and catastrophic.
+        #
+        # PC Lemmings' copy protection copies these eleven bytes out and then
+        # writes back to offset 3, the bytes-per-sector field - the classic
+        # trick for reading a floppy formatted with non-standard sectors. With
+        # the vector at zero that write landed on 0000:0003, which is where the
+        # protection's own single-step decryptor keeps its pointer: it
+        # corrupted itself and ran off into encrypted bytes.
+        #
+        # The table goes where a real BIOS keeps it, F000:EFC7, and the values
+        # are IBM's for a 1.44 MB drive.
+        self.uc.mem_write(DPT_ADDR, bytes(DPT))
+        self.uc.mem_write(0x1E * 4, struct.pack("<HH", DPT_ADDR & 0x0F,
+                                                DPT_ADDR >> 4))
         self.uc.mem_write(0x46C, struct.pack("<I", 0x00010000))  # tick count
 
         env = b"COMSPEC=C:\\COMMAND.COM\x00PATH=C:\\\x00"
@@ -412,6 +439,8 @@ class DosMachine:
             self._set(UC_X86_REG_DX, self.int_counts[0x1A] * 3)
             self._set(UC_X86_REG_AX, 0)
             return
+        if intno == 0x13:
+            return self._bios_disk()
         if intno == 0x11:
             self._set(UC_X86_REG_AX, 0x0021)
             return
@@ -421,6 +450,67 @@ class DosMachine:
         if intno == 0x33:
             return self._mouse()
         self._note(f"unhandled INT {intno:02x}h AX={self._reg(UC_X86_REG_AX):04x}")
+
+    def _bios_disk(self):
+        """INT 13h, as a PC with drives fitted but no diskette in them.
+
+        The honest answer matters more than it looks. Leaving INT 13h
+        unhandled leaves the carry flag as the caller set it, and a caller
+        reads that as *success* - so a program that reads a sector is told
+        "fine, here is your data" and hands itself whatever was already in
+        its buffer.
+
+        PC Lemmings' copy protection resets the drive and reads one sector
+        from cylinders 0-3 of drives 0 and 1, 24 attempts in all. Told the
+        reads succeeded, it checked the garbage it had been handed,
+        disbelieved it, and exited to DOS. Told the drive is not ready -
+        which is true, there is no floppy - it gives up on the check and
+        carries on.
+
+        This models an empty drive, not a disk image. Nothing here reads
+        media, and nothing should: the read-only guarantee is the point.
+        """
+        ax = self._reg(UC_X86_REG_AX)
+        ah, al = (ax >> 8) & 0xFF, ax & 0xFF
+        dl = self._reg(UC_X86_REG_DX) & 0xFF
+        hard = bool(dl & 0x80)
+
+        def done(status, al_out=None):
+            self.disk_status = status
+            self._set(UC_X86_REG_AX,
+                      (status << 8) | (al if al_out is None else al_out))
+            self._cf(status != 0)
+
+        if ah == 0x00:                     # reset - always succeeds
+            done(0x00)
+        elif ah == 0x01:                   # status of the last operation
+            self._set(UC_X86_REG_AX, self.disk_status)
+            self._cf(False)
+        elif ah in (0x02, 0x03, 0x04, 0x05):
+            # read / write / verify / format. 0x80 is "timeout, drive not
+            # ready", which is what an empty drive answers.
+            done(0x80, 0)
+        elif ah == 0x08:                   # drive parameters
+            if hard:
+                done(0x07)
+            else:
+                done(0x00)
+                # 1.44 MB geometry and one drive fitted, to agree with the
+                # diskette parameter table that INT 1Eh points at.
+                self._set(UC_X86_REG_CX, (79 << 8) | 18)
+                self._set(UC_X86_REG_DX, (1 << 8) | 1)
+                self.uc.reg_write(UC_X86_REG_ES, 0)
+                self._set(UC_X86_REG_BX, 0)
+        elif ah == 0x15:                   # disk type
+            # 01h = floppy without change-line. A program asking this is
+            # deciding whether a drive exists at all.
+            self._set(UC_X86_REG_AX, (0x00 if hard else 0x01) << 8)
+            self._cf(hard)
+        elif ah == 0x16:                   # media change
+            done(0x00)
+        else:
+            self._note(f"unhandled INT 13h AH={ah:02x}h AX={ax:04x}")
+            done(0x01)
 
     def _bios_video(self):
         ax = self._reg(UC_X86_REG_AX)

@@ -89,12 +89,30 @@ level editor, and nothing on disk changes.
   read pixel), 0Fh (mode query), 10h/10h and 10h/12h (DAC registers). The
   text ones are what Ducks' README screen and PickEggs draw with
 - mode geometry known for 00h, 01h, 04h, 05h, 06h, 0Dh, 0Eh, 10h, 12h and 13h
+- **INT 1Eh points at a Diskette Parameter Table** at F000:EFC7, eleven bytes
+  with IBM's 1.44 MB values. Real hardware always has one, and a vector left at
+  zero sends a program that follows it into the interrupt vector table instead:
+  PC Lemmings' protection copies the table out and writes back to offset 3, the
+  bytes-per-sector field, and at 0000:0003 that landed on the pointer its own
+  single-step decryptor keeps at 0000:0000 - it corrupted itself and ran off
+  into encrypted bytes
 - the BIOS data area carries the video mode at 0040:0049 and **the CRTC's base
   I/O port at 0040:0063** (0x3D4, or 0x3B4 in mode 07h), both kept in step
   across a mode set. A program that wants the retrace bit reads the base from
   there rather than assuming one, and then polls base+6 - PC Lemmings does
   exactly that, and with 0040:0063 left at zero it polled *port 6* twenty-six
   million times waiting for a bit that could never arrive
+
+### Disk (INT 13h)
+
+- reset, status, read, write, verify, format, drive parameters, disk type and
+  media change - answered as **a PC with drives fitted but no diskette in
+  them**: reset succeeds, transfers fail with AH=80h, "not ready". There is no
+  emulated media and there should not be; the read-only guarantee is the point
+- the honest failure matters. Unhandled, INT 13h left the carry flag as the
+  caller set it, which reads as *success* - so PC Lemmings' copy protection was
+  told its 24 sector reads had worked, checked the uninitialised buffer it had
+  been handed, disbelieved it and quit
 
 ### Input
 
