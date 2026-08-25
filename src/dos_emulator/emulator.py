@@ -1096,16 +1096,12 @@ class VgaDos(DosMachine):
     # the rule (Ducks writes saves through) can say so in the same place.
     fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
 
-    def __init__(self, exe, blaster=False, vsync_hz=60.0,
-                 port60_releases=False, **kw):
+    def __init__(self, exe, blaster=False, vsync_hz=60.0, **kw):
         # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
         # CGA, which is what Popcorn was written for and paces on. A VGA
         # refreshes its 200-line modes at 70 Hz, and a game that paces on the
         # retrace - Ducks does - runs a sixth slow at the CGA rate.
         self.vsync_hz = vsync_hz
-        # Whether a key release on the BIOS path shows on port 0x60 as a
-        # break code. See press_key.
-        self.port60_releases = port60_releases
         self.palette = [(0, 0, 0)] * 256
         self.dac_index = 0
         self.dac_phase = 0
@@ -1470,18 +1466,17 @@ class VgaDos(DosMachine):
         code = scancode if down else (scancode | 0x80)
         if self.guest_owns_keyboard():
             self.scan_queue.append((code, ascii_))
-        elif down:
-            self.key_buf.append((scancode, ascii_))
-            self.last_scancode = code
-        elif self.port60_releases:
-            # A program on the BIOS path may still read port 0x60 for key-up
-            # - Ducks does - and a release that never arrives there is a key
-            # held down forever. Opt-in rather than the default, because it
-            # changes what every BIOS-path program sees on the port: a driver
-            # that presses and releases in one instant leaves a break code
-            # there where the old behaviour left the make code. Popcorn's
-            # sweep showed no difference either way (2026-08-25), but the
-            # rule is that a default does not move without a reason to.
+        else:
+            if down:
+                self.key_buf.append((scancode, ascii_))
+            # The 8042 latches every transition into port 0x60, make and
+            # break, whoever owns INT 09h. A program on the BIOS path that
+            # polls the port for key-up - Ducks does - sees the release, and
+            # one that never arrived would be a key held down forever. What
+            # a caller must not do is press and release in the same instant:
+            # the break code then overwrites the make before the guest runs
+            # an instruction, and a poller sees only key-ups. Hold a press
+            # for some frames, as --keys and the control socket do.
             self.last_scancode = code
 
     def service_keyboard(self):
@@ -2387,13 +2382,21 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
     script.sort()
     script.reverse()          # popped from the end, earliest first
 
+    # Presses from a script are held for a couple of display frames rather
+    # than released in the same instant. On the BIOS path the release lands
+    # on port 0x60 as the break code, and a release with no guest time after
+    # the make means a program polling the port sees only key-ups - a real
+    # key is down for tens of milliseconds, tens of thousands of
+    # instructions. The control socket holds its presses the same way.
+    held = []                      # (scancode, ascii, frame it lifts on)
+
     def send(key, release, why):
         sc, asc = KEYMAP[key]
         if release:
             m.press_key(sc, asc, down=False)
         else:
             m.press_key(sc, asc, down=True)
-            m.press_key(sc, asc, down=False)
+            held.append((sc, asc, frames + 2))
         print(f"  [keys] {why} {'release' if release else 'press'} "
               f"scan {sc:#04x}")
 
@@ -2510,6 +2513,10 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             else:
                 budget_t = time.perf_counter()
 
+        for h in list(held):
+            if frames >= h[2]:
+                m.press_key(h[0], h[1], down=False)
+                held.remove(h)
         while script and script[-1][0] <= m._elapsed():
             when, key, release = script.pop()
             send(key, release, f"t={when:.1f}s")
