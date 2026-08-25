@@ -301,6 +301,30 @@ means one of two things, and both need acting on:
 - it is **game logic you wrote yourself instead of transcribing**, which is
   the thing this whole method exists to avoid.
 
+**Keep `main.c` and `devmain.c` apart, and build two binaries.** A DOS game
+has no command line: it starts, shows its menu, and plays. So `main.c` mirrors
+that and nothing else, and every developer flag — render one screen to a file,
+force a rating or a scroll position, skip a stage, dump indices for a
+comparison — goes in `devmain.c` and links into a second binary.
+
+It drifts the other way on its own, because each flag is easier to add where
+the argument parsing already is. In the PC Lemmings port that produced a
+four-hundred-line `main.c` in which the actual start-up — the part that
+corresponds to the original — was a dozen lines lost in the middle of the
+options. A reader opening the file named after the program's entry point found
+a developer console.
+
+The split also keeps the tools honest: `tools/` calls the dev binary, so
+nothing a comparison depends on can quietly become part of what ships.
+
+While you are there, be suspicious of a file writer in the game path at all.
+That port had a `--out` that wrote a BMP, and nothing wanted one — a BMP
+throws away the palette *index* a pixel had, which is exactly what a
+comparison against the original's video memory needs, and two different
+indices can share a colour. `--raw` carried the indices; pictures were the
+diff tool's job. The flag had been passing `--out /dev/null` in the proof
+script for a very long time.
+
 **Default to transcribing.** If a routine does something the original does, go
 and find it and read it, rather than writing a version that behaves the same.
 The two are not equivalent: a behavioural match is only as good as the states
