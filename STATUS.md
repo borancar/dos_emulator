@@ -166,6 +166,12 @@ level editor, and nothing on disk changes.
   frames before its release (`--keys`, the control socket); pressing and
   releasing in one instant leaves only the break code for a poller to see
 - INT 33h mouse: reset, show and hide cursor, read position and buttons
+- **a mouse button can be driven from outside** - `DosMachine.click_mouse()`
+  and the control socket's `click` verb, with a split `click down` / `click up`
+  so a button can be *held*. A screen that waits on a click cannot be reached
+  any other way: PC Lemmings' level briefing says "Press mouse button to
+  continue" and means it, and a press-and-release inside one frame is invisible
+  to a guest that polls the button state rather than a press count
 
 ### Sound
 

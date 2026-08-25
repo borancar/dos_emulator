@@ -32,6 +32,9 @@ asked for its registers is what a differential check needs when it disagrees.
 One line in, one line back, connection closes:
 
     key <name> [frames]   press a key, held for `frames` display frames
+    click [btn] [x y]     press and release a mouse button, optionally moving
+                          the cursor there first - for a screen that waits on
+                          a click and cannot be reached with the keyboard
     text <string>         press each character of the string in turn
     snap [note]           ask the loop for a capture at its next boundary
     status                frame, mode, pending keys, CS:IP
@@ -252,6 +255,27 @@ class Control:
             name, _, hold = rest.partition(" ")
             sc = self._press(m, name, int(hold) if hold.strip() else 2)
             return f"ok: pressed {name} (scancode {sc:#04x})"
+        if cmd == "click":
+            # click [down|up] [button] [x y]
+            # With neither down nor up, press and release, so a guest polling
+            # either count sees it. A guest that polls the button *state*
+            # (AX=0003h) instead needs the button held, hence the split form.
+            parts = rest.split()
+            phase = None
+            if parts and parts[0].lower() in ("down", "up"):
+                phase = parts.pop(0).lower()
+            btn = int(parts[0]) if parts else 0
+            x = int(parts[1]) if len(parts) > 2 else None
+            y = int(parts[2]) if len(parts) > 2 else None
+            if phase == "down":
+                pos = m.click_mouse(btn, x, y, down=True)
+                return f"ok: button {btn} down at {pos[0]},{pos[1]}"
+            if phase == "up":
+                pos = m.click_mouse(btn, x, y, down=False)
+                return f"ok: button {btn} up at {pos[0]},{pos[1]}"
+            pos = m.click_mouse(btn, x, y, down=True)
+            m.click_mouse(btn, None, None, down=False)
+            return f"ok: clicked button {btn} at {pos[0]},{pos[1]}"
         if cmd == "text":
             for ch in rest:
                 self._press(m, ch, 2)

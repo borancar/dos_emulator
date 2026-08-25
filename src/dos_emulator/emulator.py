@@ -1737,6 +1737,30 @@ class VgaDos(DosMachine):
             # for some frames, as --keys and the control socket do.
             self.last_scancode = code
 
+    def click_mouse(self, button=0, x=None, y=None, down=True):
+        """Press or release a mouse button, updating what INT 33h reports.
+
+        A driver needs this for the same reason it needs press_key: a screen
+        that waits for a click cannot be reached any other way. PC Lemmings'
+        level briefing says "Press mouse button to continue" and means it.
+
+        The counts are what AX=0005h/0006h hand back and clear, so a press
+        that is never read stays pending rather than being lost - which is
+        what lets a click land while the guest is busy drawing.
+        """
+        idx = min(max(int(button), 0), 2)
+        if x is not None and y is not None:
+            self.mouse_pos = (int(x), int(y))
+        if down:
+            self.mouse_btn |= (1 << idx)
+            self.press_count[idx] += 1
+            self.press_pos[idx] = self.mouse_pos
+        else:
+            self.mouse_btn &= ~(1 << idx) & 0xFFFF
+            self.release_count[idx] += 1
+            self.release_pos[idx] = self.mouse_pos
+        return self.mouse_pos
+
     def service_timer(self):
         """Deliver IRQ 0 as INT 08h when the programmed interval has elapsed.
 
