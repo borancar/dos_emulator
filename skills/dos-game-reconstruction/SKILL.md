@@ -494,6 +494,36 @@ is to find what writes *into* the buffer, one step further back, and probe
 
 ## Traps that cost real time
 
+- **A check at one value of a parameter says nothing about the parameter.**
+  PC Lemmings' menu draws the difficulty name from
+  `RATING_BASE + rating * RATING_STEP`. The four sprites are stored
+  *backwards*, so that is right for exactly one of the four values it takes —
+  and only rating 0 was reachable, because the control that changes it looked
+  inert. **At `rating == 0` the sign of the step does not matter.** The
+  comparison passed at 99.4%, repeatedly, and was structurally incapable of
+  catching the one thing that was wrong. If a routine takes a parameter, reach
+  more than one value before calling it verified; if you cannot reach the
+  others, record that where the score is reported, not in a comment beside the
+  code.
+
+- **"Not delivered" and "delivered, no effect" are different findings.** A key
+  sweep concluded that a menu control answered to nothing, having "tried
+  twenty-five keys". Four of them were rejected by the input layer — the
+  control socket resolves names with `pygame.key.key_code`, which names
+  punctuation by the character, so `"minus"` is not a key name and `-` is —
+  and the sweep printed `error: unknown key name` in the same column as a real
+  measurement. Two keys that *do* work were never in the list, though the
+  prose named them as ruled out. **Make the probe fail loudly on input it
+  could not send**, and treat a negative result as evidence only if a positive
+  control fired in the same run.
+
+- **A null result measured from the boundary is not a null result.** The same
+  sweep watched the control's own pixels with the value already at its
+  minimum, where the "decrease" key is *supposed* to do nothing. A correct key
+  is indistinguishable from a dead one there. Watch the variable rather than
+  the redraw — one byte settles what a pixel box cannot — and test each
+  direction from somewhere it can actually move.
+
 - **A "known gap" you argued away is the most expensive kind.** Writing a gap
   down is not the same as bounding it, and an argument for why it cannot
   matter is exactly the thing to distrust. This emulator listed "reads of
