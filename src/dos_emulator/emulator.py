@@ -1224,13 +1224,34 @@ MODE_GEOM = {0x13: (320, 200), 0x00: (320, 200), 0x01: (320, 200),
 # which is a different decode from Mode X even though the planes are the same
 # memory. PC Lemmings runs in 0Dh and then 10h.
 PLANAR16_MODES = (0x0D, 0x0E, 0x10, 0x12)
-# What the BIOS leaves in the attribute controller's palette for those modes.
-# It is NOT the identity: colours 8-15 are mapped up to DAC entries 0x38-0x3F,
-# and 6 to 0x14. A program that never touches port 0x3c0 - PC Lemmings does
-# not - depends on exactly this, and with an identity map its upper eight
-# colours all come out of DAC entries it never wrote, i.e. black.
-EGA_DEFAULT_ATTR = (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
-                    0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F)
+# What the BIOS leaves in the attribute controller's palette. It is NOT the
+# identity, and it is NOT the same for every 16-colour mode - which is the
+# part that is easy to get wrong, because one table makes some screens right
+# and leaves others black.
+#
+# The 200-line modes 0Dh and 0Eh map the upper eight colours to DAC 0x10-0x17;
+# the higher-resolution 10h and 12h map them to 0x38-0x3F and colour 6 to
+# 0x14. A program that never touches port 0x3c0 depends on exactly this.
+#
+# PC Lemmings is the evidence and the reason both are here: it writes DAC
+# entries 0x38-0x3F for its mode 10h title screen and 0x10-0x17 for its mode
+# 0Dh play screen, following each mode's default rather than programming the
+# attribute controller at all. Given the 10h table for both, its title drew
+# perfectly and its level terrain drew in black - the pixels were right and
+# pointed at DAC entries nothing had written.
+EGA_ATTR_200 = (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17)
+EGA_ATTR_HIRES = (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
+                  0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F)
+
+
+def default_attr_palette(mode):
+    """The attribute palette a BIOS mode set leaves behind."""
+    if mode in (0x0D, 0x0E):
+        return list(EGA_ATTR_200)
+    if mode in (0x10, 0x12):
+        return list(EGA_ATTR_HIRES)
+    return list(range(16))
 VGA_A000 = 0xA0000
 VGA_B800 = 0xB8000
 CGA_MODES = (0x04, 0x05, 0x06)
@@ -2172,8 +2193,7 @@ class VgaDos(DosMachine):
             # A mode set reloads the attribute controller's palette, and the
             # 16-colour planar modes do not get an identity map. See
             # EGA_DEFAULT_ATTR.
-            self.attr_pal = (list(EGA_DEFAULT_ATTR) if self.mode in PLANAR16_MODES
-                             else list(range(16)))
+            self.attr_pal = default_attr_palette(self.mode)
             self.attr_flipflop = False
             # NOT reset here: chain4, the Graphics Controller and the latches.
             # A BIOS mode set really does reset all three, and doing so was

@@ -38,6 +38,8 @@ One line in, one line back, connection closes:
     text <string>         press each character of the string in turn
     snap [note]           ask the loop for a capture at its next boundary
     status                frame, mode, pending keys, CS:IP
+    planes <path>         dump the four plane shadows to a file - all 64K,
+                          not just the window the start address points at
     vga                   the video state: mode, geometry, planes, the
                           graphics controller, the CRTC and the attribute
                           palette - what a blank screen is usually hiding in
@@ -287,7 +289,26 @@ class Control:
             return self.snapshot(m, rest)
         if cmd == "vga":
             st = m.vga_state() if hasattr(m, "vga_state") else {}
+            # Where the data actually is, in 4K pages. "The screen is blank"
+            # is nearly always "the picture is somewhere the start address is
+            # not", and this is the cheapest way to see that.
+            hist = ""
+            planes = getattr(m, "planes", None)
+            if planes:
+                pl = planes[0]
+                cells = []
+                for page in range(0, 0x10000, 0x1000):
+                    n = sum(1 for b in pl[page:page + 0x1000] if b)
+                    cells.append("." if n == 0 else
+                                 str(min(9, 1 + n * 9 // 0x1000)))
+                hist = "".join(cells) + "   (plane 0, 4K pages, 0=. 9=full)"
+            pal = getattr(m, "palette", [])
+            lit = [i for i, c in enumerate(pal) if c != (0, 0, 0)]
             extra = {
+                "lit_dac_entries": (" ".join(f"{i:02x}" for i in lit[:40])
+                                    + ("..." if len(lit) > 40 else "")
+                                    or "(none)"),
+                "plane0_map": hist,
                 "attr_pal": " ".join(f"{v:02x}" for v in
                                      getattr(m, "attr_pal", [])),
                 "gc": " ".join(f"{v:02x}" for v in getattr(m, "gc", [])),
@@ -296,6 +317,26 @@ class Control:
             }
             return "\n".join(f"{k} = {v}" for k, v in
                               list(st.items()) + list(extra.items()))
+        if cmd == "planes":
+            # Write the four plane shadows to a file, so all 64K of video
+            # memory can be looked at rather than just the window the start
+            # address happens to point at. "The screen is blank" and "the
+            # picture is drawn somewhere else" look identical from a
+            # screenshot and completely different from this.
+            path = rest.strip()
+            if not path:
+                return "usage: planes /path/to/file"
+            planes = getattr(m, "planes", None)
+            if not planes:
+                return "error: this machine has no plane shadows"
+            try:
+                with open(path, "wb") as f:
+                    for pl in planes:
+                        f.write(bytes(pl))
+            except OSError as e:
+                return f"error: {e}"
+            return (f"ok: wrote {len(planes)} planes x {len(planes[0])} bytes "
+                    f"to {path}")
         if cmd == "status":
             return (f"frame={getattr(m, 'frames', 0)} "
                     f"mode={getattr(m, 'mode', 0):#04x} "

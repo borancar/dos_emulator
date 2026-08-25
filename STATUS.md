@@ -16,7 +16,8 @@ Updated 2026-08-25.
 | **POPGEN** (Popcorn's level editor) | text mode 03h, BIOS keyboard via INT 16h, INT 21h AH=19h/47h | ran unmodified the first time; its file formats were measured through it |
 | **POPSPEED** (Popcorn's speed utility) | INT 21h AX=2568h and nothing else | trivial - sets an interrupt vector and exits |
 | **Ducks** (Furnish / Hungry Software, 1998-2000) | VGA mode 13h switched to Mode X - planar writes through the map mask, the CRTC start address, the DAC; Sound Blaster 8-bit auto-init DMA on IRQ 5; XMS; the BIOS keyboard and port 0x60; INT 33h mouse; the control socket | the project the VGA, Sound Blaster, XMS, directory-service and control-socket code come from. Rebased onto this emulator on 2026-08-25: its own port's checks ran unchanged through it - the snapshot-replay comparison of its natives against the original, and its C-against-guest tests - and `Ducks.unpacked.exe` runs here from the README through the splash to the menu and its demo level, with the DAC, planar and DMA paths live. See the Ducks repository's STATUS.md for the numbers |
-| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, an interrupt gate that clears TF (the game single-steps itself to decrypt its own code), the INT 1Eh diskette parameter table, INT 13h, and INT 21h AH=1Bh | as of 2026-08-25 it runs: both start-up menus, its copy protection, the title screen, the level briefing, and into the level itself, with lemmings falling and the clock running. Its title screen renders correctly. **The play area's terrain does not**, and why is still open (see *Known gaps*). No routine has been transcribed or checked |
+| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, an interrupt gate that clears TF (the game single-steps itself to decrypt its own code), the INT 1Eh diskette parameter table, INT 13h, and INT 21h AH=1Bh | as of 2026-08-25 it runs: both start-up menus, its copy protection, the title screen, the level briefing, and into the level itself, with lemmings falling and the clock running. Its title screen renders correctly. Its title screen and its **first level render completely** - terrain, entrance,
+lemmings, exit, control panel, minimap and cursor. No routine has been transcribed or checked |
 | **PickEggs** (Ducks' egg selector) | text mode 03h, INT 21h AH=1Ah/3Bh/47h/4Eh/4Fh - a directory browser | its file-operation log and its screen came out byte-identical to the Ducks project's own emulator on 2026-08-25 |
 
 Popcorn is the reason most of this exists, and it is why the CGA and PC-speaker
@@ -98,11 +99,14 @@ level editor, and nothing on disk changes.
   goes through the same path unchanged
 - **the attribute controller** at 0x3c0, its index/data flip-flop and the reset
   of that flip-flop by a read of 0x3da. Its 16-entry palette maps a pixel to a
-  DAC entry, and the BIOS default for the planar modes is **not** the identity:
-  colours 8-15 map to DAC 0x38-0x3F. PC Lemmings never programs port 0x3c0 and
-  depends entirely on that default; with an identity map its upper eight
-  colours came out of DAC entries it had never written, and the title screen
-  drew in black and dark red
+  DAC entry, and the BIOS default is **not** the identity **and not the same
+  for every 16-colour mode**: the 200-line modes 0Dh and 0Eh send colours 8-15
+  to DAC 0x10-0x17, while 10h and 12h send them to 0x38-0x3F and colour 6 to
+  0x14. A program that never programs port 0x3c0 depends entirely on this, and
+  PC Lemmings is exactly that program - it writes DAC 0x38-0x3F for its mode
+  10h title and 0x10-0x17 for its mode 0Dh level. One table for both modes is
+  the trap: the title drew perfectly and the level terrain drew in black, its
+  pixels correct and pointing at DAC entries nothing had written
 - mode geometry known for 00h, 01h, 04h, 05h, 06h, 0Dh, 0Eh, 10h, 12h and 13h
 - **INT 1Eh points at a Diskette Parameter Table** at F000:EFC7, eleven bytes
   with IBM's 1.44 MB values. Real hardware always has one, and a vector left at
@@ -207,17 +211,6 @@ on before pressing replaced the wall-clock scripts that missed.
   the read hook made the emulator too slow to reach PC Lemmings' title screen
   at all. It wants doing in **bulk**, syncing a plane into flat memory when
   the read map select changes.
-- **PC Lemmings' play-area terrain does not render, cause not yet found.** Its
-  panel, minimap, sprites and objects all draw. What is known: in the level it
-  is mode 0Dh with CRTC offset 22, so **44-byte rows, not 40**, and it
-  page-flips, with the start address alternating between 0x27e2 and 0x2c2.
-  The framebuffer decode does honour the offset and the start address.
-  (**Retracted 2026-08-25**: this was previously blamed on planar reads, on
-  the theory that the level was copied video-to-video. It is not. The blit's
-  source segment is held at `ds:0x1fe4` and reads **0x8000** - main RAM at
-  512 KB - so the copy is memory-to-video and goes through the write path
-  like everything else that does draw. The theory was plausible and wrong,
-  and the fix built for it fixed nothing.)
 - **Resetting chain4, the Graphics Controller and the latches on a BIOS mode
   set** - which real hardware does - turns PC Lemmings' play screen black from
   the first frame. Something here depends on them surviving a mode set. Left
