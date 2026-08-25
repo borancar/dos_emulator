@@ -40,6 +40,11 @@ One line in, one line back, connection closes:
     status                frame, mode, pending keys, CS:IP
     dump <addr> <n> <p>   guest memory to a file, for when the thing to look
                           at is tens of kilobytes rather than a hex window
+    watch <lo> <hi> [rw]  record which code touches a range of memory;
+                          `watch report` lists it, `watch off` stops. For
+                          "where is this buffer written from", where a
+                          breakpoint cannot help because the address you would
+                          break on is the thing you are looking for
     screen <path>         the decoded screen and its palette, as indices -
                           what a reimplementation is checked against
     planes <path>         dump the four plane shadows to a file - all 64K,
@@ -90,12 +95,13 @@ the project's names beside the addresses.
 """
 import os
 import queue
+from collections import Counter
 import socket
 import struct
 import threading
 
 import pygame
-from unicorn import UC_HOOK_CODE
+from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
 from unicorn.x86_const import (
     UC_X86_REG_AX, UC_X86_REG_BX, UC_X86_REG_CX, UC_X86_REG_DX,
     UC_X86_REG_SI, UC_X86_REG_DI, UC_X86_REG_BP, UC_X86_REG_SP,
@@ -256,6 +262,14 @@ class Control:
         finally:
             m.ctl_can_run = False
 
+    def _watch_off(self, m):
+        for h in getattr(m, "watch_hooks", []) or []:
+            try:
+                m.uc.hook_del(h)
+            except Exception:
+                pass
+        m.watch_hooks = []
+
     def _apply(self, m, line):
         self._reap(m)
         cmd, _, rest = line.partition(" ")
@@ -342,6 +356,47 @@ class Control:
             except Exception as e:
                 return f"error: {e}"
             return f"ok: wrote {m.width}x{m.height} screen to {path}"
+        if cmd == "watch":
+            # watch <lo> <hi> [r|w|rw] | watch report | watch off
+            # Which code touches a range of memory. "Where is this buffer
+            # written from?" is otherwise a question a breakpoint cannot
+            # answer, because you do not know the address to break on - that
+            # is what you are trying to find.
+            parts = rest.split()
+            if parts and parts[0] == "report":
+                if not getattr(m, "watch_pcs", None):
+                    return "no watch data; `watch <lo> <hi>` first"
+                base = self.image_base(m)
+                top = sorted(m.watch_pcs.items(), key=lambda kv: -kv[1])[:20]
+                return "\n".join(
+                    f"  img{pc - base:#08x}  {n:>9}  {self.describe(m, pc - base)}"
+                    for pc, n in top)
+            if parts and parts[0] == "off":
+                self._watch_off(m)
+                return "ok: watch removed"
+            if len(parts) < 2:
+                return "usage: watch <lo> <hi> [r|w|rw] | watch report | watch off"
+            lo = self._addr(m, parts[0])
+            hi = self._addr(m, parts[1])
+            how = parts[2] if len(parts) > 2 else "w"
+            self._watch_off(m)
+            m.watch_pcs = Counter()
+
+            def note(uc, access, address, size, value, user):
+                pc = (uc.reg_read(UC_X86_REG_CS) * 16
+                      + uc.reg_read(UC_X86_REG_IP))
+                m.watch_pcs[pc] += 1
+
+            hooks = []
+            if "w" in how:
+                hooks.append(m.uc.hook_add(UC_HOOK_MEM_WRITE, note,
+                                           None, lo, hi))
+            if "r" in how:
+                hooks.append(m.uc.hook_add(UC_HOOK_MEM_READ, note,
+                                           None, lo, hi))
+            m.watch_hooks = hooks
+            return (f"ok: watching {lo:#07x}..{hi:#07x} for "
+                    f"{'reads and writes' if how == 'rw' else how}")
         if cmd == "dump":
             # dump <addr> <len> <path> - guest memory to a file. `read` prints
             # a hex window; this is for the case where what you need to look at
