@@ -291,6 +291,15 @@ routine to run at all is most of the work. In rough order of preference:
 - **Poke to fast-forward, not to fake.** Clearing the brick count is what the
   play loop already watches for, so the game runs its own level-done path from
   there. The state is the game's own, only sooner.
+- **Give the guest a real allocator before believing anything it draws.** A
+  DOS memory call that returns the same segment for every request is a
+  plausible-looking stub and a disaster: a program that allocates twice gets
+  two names for one block and quietly overwrites itself, and the damage shows
+  up as *subtly* wrong graphics rather than a crash. PC Lemmings' skill panel
+  drew as mottled noise for exactly this reason. Implement the free list, and
+  answer "how much memory is there" honestly — a program told the truth about
+  a small machine will say so, which is a much better failure than silent
+  corruption.
 - **Bias the RNG tables.** A 7-in-255 outcome is never reached by playing. Zero
   the cumulative weights up to the wanted entry and it comes out every time —
   and because the poke lives in the snapshot, *both sides see the same table*,
@@ -339,6 +348,18 @@ which makes the game's speed a property of the machine rather than of the game.
 - **A stale output file reads as a successful run.** Delete the target before a
   capture, and check the exit status — a crashed run leaves yesterday's file
   sitting there looking plausible.
+- **A blank capture scores as a perfect match, and a *faded* one is worse.**
+  Comparing a reimplementation against a capture taken before the screen was
+  drawn compares two empty images and reports 100%. The version that actually
+  bit: a screen caught **mid palette-fade** has a perfectly varied set of
+  pixel indices and a palette in which every entry is black, so a guard that
+  checks index diversity passes it, every pixel still renders as black, the
+  port's empty margin matches it exactly, and the run prints EXACT MATCH.
+  Judge a capture on its **rendered colours**, not its indices, and refuse one
+  that is nearly all a single colour. Then take the capture on a cue — poll
+  until the picture is actually bright, and keep the **brightest** sample
+  rather than the last, because a fade at the end of a level will otherwise
+  hand you black just as the timeout expires.
 - **Check the baseline before diagnosing a failure.** If a comparison fails
   after a change, rebuild at the previous commit and run the *same* check. Half
   the time the divergence was already there and belongs to someone else.
