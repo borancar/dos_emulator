@@ -38,6 +38,9 @@ One line in, one line back, connection closes:
     text <string>         press each character of the string in turn
     snap [note]           ask the loop for a capture at its next boundary
     status                frame, mode, pending keys, CS:IP
+    vga                   the video state: mode, geometry, planes, the
+                          graphics controller, the CRTC and the attribute
+                          palette - what a blank screen is usually hiding in
     quit                  ask the run to stop
     pause                 stop at the end of this chunk
     cont                  resume after a breakpoint or a pause
@@ -282,6 +285,17 @@ class Control:
             return f"ok: pressed {len(rest)} key(s)"
         if cmd == "snap":
             return self.snapshot(m, rest)
+        if cmd == "vga":
+            st = m.vga_state() if hasattr(m, "vga_state") else {}
+            extra = {
+                "attr_pal": " ".join(f"{v:02x}" for v in
+                                     getattr(m, "attr_pal", [])),
+                "gc": " ".join(f"{v:02x}" for v in getattr(m, "gc", [])),
+                "crtc": " ".join(f"{i:02x}={v:02x}" for i, v in
+                                 sorted(getattr(m, "crtc", {}).items())),
+            }
+            return "\n".join(f"{k} = {v}" for k, v in
+                              list(st.items()) + list(extra.items()))
         if cmd == "status":
             return (f"frame={getattr(m, 'frames', 0)} "
                     f"mode={getattr(m, 'mode', 0):#04x} "

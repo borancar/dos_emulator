@@ -16,7 +16,7 @@ Updated 2026-08-25.
 | **POPGEN** (Popcorn's level editor) | text mode 03h, BIOS keyboard via INT 16h, INT 21h AH=19h/47h | ran unmodified the first time; its file formats were measured through it |
 | **POPSPEED** (Popcorn's speed utility) | INT 21h AX=2568h and nothing else | trivial - sets an interrupt vector and exits |
 | **Ducks** (Furnish / Hungry Software, 1998-2000) | VGA mode 13h switched to Mode X - planar writes through the map mask, the CRTC start address, the DAC; Sound Blaster 8-bit auto-init DMA on IRQ 5; XMS; the BIOS keyboard and port 0x60; INT 33h mouse; the control socket | the project the VGA, Sound Blaster, XMS, directory-service and control-socket code come from. Rebased onto this emulator on 2026-08-25: its own port's checks ran unchanged through it - the snapshot-replay comparison of its natives against the original, and its C-against-guest tests - and `Ducks.unpacked.exe` runs here from the README through the splash to the menu and its demo level, with the DAC, planar and DMA paths live. See the Ducks repository's STATUS.md for the numbers |
-| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, an interrupt gate that clears TF (the game single-steps itself to decrypt its own code), the INT 1Eh diskette parameter table, INT 13h, and INT 21h AH=1Bh | as of 2026-08-25 it runs: both start-up menus, its copy protection, the title screen, the level briefing, and into the level itself, with lemmings falling and the clock running. Its title screen renders correctly. **The play area's terrain does not** - it is copied video-to-video and planar reads are not modelled (see *Known gaps*); everything only ever written draws fine. No routine has been transcribed or checked |
+| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, an interrupt gate that clears TF (the game single-steps itself to decrypt its own code), the INT 1Eh diskette parameter table, INT 13h, and INT 21h AH=1Bh | as of 2026-08-25 it runs: both start-up menus, its copy protection, the title screen, the level briefing, and into the level itself, with lemmings falling and the clock running. Its title screen renders correctly. **The play area's terrain does not**, and why is still open (see *Known gaps*). No routine has been transcribed or checked |
 | **PickEggs** (Ducks' egg selector) | text mode 03h, INT 21h AH=1Ah/3Bh/47h/4Eh/4Fh - a directory browser | its file-operation log and its screen came out byte-identical to the Ducks project's own emulator on 2026-08-25 |
 
 Popcorn is the reason most of this exists, and it is why the CGA and PC-speaker
@@ -201,19 +201,28 @@ on before pressing replaced the wall-clock scripts that missed.
 - **A read of planar memory returns flat memory, not the selected plane.**
   Writes are shadowed into four planes; reads are not corrected, so what comes
   back is whichever byte was written to that address last, for whatever plane.
-  A program that reads video memory back for its *content* - a video-to-video
-  blit - gets garbage.
-  **PC Lemmings' play area is exactly that and is not drawn**: its panel,
-  minimap, sprites and objects all appear, because those are only ever
-  written, while the level terrain never does.
-  Two attempts are recorded so they are not repeated: fixing it per access,
-  with a `mem_write` from inside the read hook, is correct but *far* too slow -
-  the blitter reads 553k times and the emulator could no longer reach its own
-  title screen. And resetting chain4, the Graphics Controller and the latches
-  on a BIOS mode set - which real hardware does - turned the play screen black
-  from the first frame, so something here depends on them surviving a mode
-  set. The fix wants doing in **bulk**: sync a plane into flat memory when the
-  read map select changes, not on every access.
+  A program that reads video memory back for its *content* would get garbage.
+  Nothing has been shown to need it yet - see the retraction below - and the
+  cheap fix is not cheap: correcting per access with a `mem_write` from inside
+  the read hook made the emulator too slow to reach PC Lemmings' title screen
+  at all. It wants doing in **bulk**, syncing a plane into flat memory when
+  the read map select changes.
+- **PC Lemmings' play-area terrain does not render, cause not yet found.** Its
+  panel, minimap, sprites and objects all draw. What is known: in the level it
+  is mode 0Dh with CRTC offset 22, so **44-byte rows, not 40**, and it
+  page-flips, with the start address alternating between 0x27e2 and 0x2c2.
+  The framebuffer decode does honour the offset and the start address.
+  (**Retracted 2026-08-25**: this was previously blamed on planar reads, on
+  the theory that the level was copied video-to-video. It is not. The blit's
+  source segment is held at `ds:0x1fe4` and reads **0x8000** - main RAM at
+  512 KB - so the copy is memory-to-video and goes through the write path
+  like everything else that does draw. The theory was plausible and wrong,
+  and the fix built for it fixed nothing.)
+- **Resetting chain4, the Graphics Controller and the latches on a BIOS mode
+  set** - which real hardware does - turns PC Lemmings' play screen black from
+  the first frame. Something here depends on them surviving a mode set. Left
+  out until that is understood, because correct-looking and wrong is worse
+  than a known gap.
 - **The CRTC is only partly honoured in the planar modes.** Geometry comes from
   the mode number, so a program that reprograms the CRTC for a different size
   is rendered at the BIOS size. PC Lemmings sets mode 10h (640x350) and pans by
