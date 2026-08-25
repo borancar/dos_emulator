@@ -1281,6 +1281,18 @@ KEYMAP = {
     pygame.K_COMMA: (0x33, 0x2C), pygame.K_PERIOD: (0x34, 0x2E),
     pygame.K_MINUS: (0x0C, 0x2D), pygame.K_EQUALS: (0x0D, 0x3D),
     pygame.K_SEMICOLON: (0x27, 0x3B), pygame.K_SLASH: (0x35, 0x2F),
+    # The rest of the main block, and the keypad keys that have a plain XT
+    # scancode of their own. Added because a key that is absent here is not
+    # refused loudly - `control`'s `key` command raises, but a sweep that
+    # treats the reply as text reads "not a key this machine reads" as "the
+    # key did nothing", which is a different finding entirely. PC Lemmings
+    # takes the rating up on ` (scancode 0x29) as well as on Up, and that was
+    # untestable until this line existed.
+    pygame.K_BACKQUOTE: (0x29, 0x60), pygame.K_QUOTE: (0x28, 0x27),
+    pygame.K_BACKSLASH: (0x2B, 0x5C),
+    pygame.K_INSERT: (0x52, 0x00), pygame.K_DELETE: (0x53, 0x00),
+    pygame.K_KP_MULTIPLY: (0x37, 0x2A), pygame.K_KP_MINUS: (0x4A, 0x2D),
+    pygame.K_KP_PLUS: (0x4E, 0x2B),
 }
 for i, k in enumerate("qwertyuiop"):
     KEYMAP[getattr(pygame, f"K_{k}")] = (0x10 + i, ord(k))
