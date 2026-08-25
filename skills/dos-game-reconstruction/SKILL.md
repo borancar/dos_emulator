@@ -362,6 +362,16 @@ which makes the game's speed a property of the machine rather than of the game.
 - **A stale output file reads as a successful run.** Delete the target before a
   capture, and check the exit status — a crashed run leaves yesterday's file
   sitting there looking plausible.
+- **Judge a capture against what it should look like, not against a proxy.**
+  "Wait until the screen is bright" sounds like the guest's own cue and is
+  not: a palette fade passes through intermediate tables whose peak component
+  is high while the hues are badly wrong, so "keep the brightest sample"
+  happily kept a level drawn in red, green and magenta. The cue that works is
+  the real thing — score each sample's palette against the palette the level's
+  own data file says it should have, and keep the closest. And check the
+  selection actually survives: a harness that picks the best sample and then
+  writes the file again afterwards throws its own choice away, which is a bug
+  that looks exactly like a bad capture.
 - **A blank capture scores as a perfect match, and a *faded* one is worse.**
   Comparing a reimplementation against a capture taken before the screen was
   drawn compares two empty images and reports 100%. The version that actually
