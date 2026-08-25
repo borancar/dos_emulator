@@ -286,6 +286,35 @@ The same goes for transcribed *data* — a palette, a jump table, a string table
 lifted out of the executable is as much a transcription as a routine, and takes
 the same comment.
 
+**Enforce it with a check, because saying it is not enough.** The PC Lemmings
+port states this convention in its `CLAUDE.md`, in the very words above, and
+then decayed anyway: audited after a long session, **13 functions carried an
+address, 12 said they were the port's own, and 45 said nothing at all.** Most
+of the 45 were written by the same session that had the convention in front of
+it. A convention nothing tests is a preference.
+
+So `reconstruct/tests/provenance.py` reads every function definition, and the
+comment block **immediately above it**, and fails while any function has
+neither an address nor an explicit "not transcribed". Wire it into the test
+target so it cannot rot again.
+
+Two things about writing that check:
+
+- **Only the comment directly above the definition counts.** The first version
+  searched a forty-line window and reported `menu_run` as transcribed from
+  `0x07D54` and `menu_set_scroll` from `0x0E45E` — both wrong, inherited from
+  whatever routine came before. A window makes the file look annotated when it
+  is not, which is worse than no check.
+- **Three outcomes, not two.** *Transcribed* (an address), *ours* (said so
+  explicitly), and *neither* — and only the third is a failure. Collapsing
+  "ours" into "not transcribed" loses the distinction the whole convention
+  exists to record.
+
+The number that matters is not how many routines exist but **how many can be
+argued back to a byte**. Keep it visible: in `STATUS.md`, as transcribed
+against the total call targets, and separately from how many are *verified* —
+those are different claims and the second is worth far more.
+
 **Always use `stdint` types, without exception** — `uint8_t`, `uint16_t`,
 `uint32_t`, `int16_t`, `int32_t`. Never `unsigned`, `unsigned char`, `short` or
 `long`. `char` stays `char` for actual strings (paths, `printf`).
