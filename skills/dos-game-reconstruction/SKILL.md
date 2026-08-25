@@ -547,7 +547,9 @@ Four things about it are worth copying rather than reinventing:
 - **Write PNG from the standard library.** No Pillow, no numpy — a
   reconstruction's whole claim is that its measurements are reproducible, and
   a picture-drawing dependency is a poor thing to stake that on. The entire
-  encoder:
+  encoder is below, and `check_snippets.py` beside this file extracts it,
+  parses it and runs it, so it cannot rot into something that merely looks
+  right:
 
   ```python
   def write_png(path, w, h, rows):          # rows: h bytearrays of 3*w, RGB
