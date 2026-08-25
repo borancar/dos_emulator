@@ -88,6 +88,21 @@ level editor, and nothing on disk changes.
   08h/09h/0Ah/0Eh (character read and write, teletype), 0Ch/0Dh (write and
   read pixel), 0Fh (mode query), 10h/10h and 10h/12h (DAC registers). The
   text ones are what Ducks' README screen and PickEggs draw with
+- **the 16-colour planar modes** 0Dh, 0Eh, 10h and 12h: eight pixels to a byte
+  across four planes, which is a different decode from Mode X even though the
+  planes are the same memory. With them, the **Graphics Controller**: the
+  latches (any read of A000 loads all four), write modes 0-3, set/reset and
+  enable set/reset, the data-rotate count and the AND/OR/XOR function, and the
+  bit mask. In their reset state these reduce to "store the CPU byte in the
+  planes the map mask selects", which is exactly what Mode X wants - so Mode X
+  goes through the same path unchanged
+- **the attribute controller** at 0x3c0, its index/data flip-flop and the reset
+  of that flip-flop by a read of 0x3da. Its 16-entry palette maps a pixel to a
+  DAC entry, and the BIOS default for the planar modes is **not** the identity:
+  colours 8-15 map to DAC 0x38-0x3F. PC Lemmings never programs port 0x3c0 and
+  depends entirely on that default; with an identity map its upper eight
+  colours came out of DAC entries it had never written, and the title screen
+  drew in black and dark red
 - mode geometry known for 00h, 01h, 04h, 05h, 06h, 0Dh, 0Eh, 10h, 12h and 13h
 - **INT 1Eh points at a Diskette Parameter Table** at F000:EFC7, eleven bytes
   with IBM's 1.44 MB values. Real hardware always has one, and a vector left at
@@ -160,14 +175,11 @@ on before pressing replaced the wall-clock scripts that missed.
 
 ## Known gaps
 
-- **EGA is geometry only, and a game now needs it.** The planar model is Mode
-  X's - four planes of mode 13h pixels selected by the map mask. The 16-colour
-  planar modes (0Dh, 0Eh, 10h, 12h) with the graphics controller's write modes,
-  bit masks and the attribute controller's palette are not modelled.
-  **PC Lemmings runs in mode 0Dh** - its "VGA" build is 16-colour planar, not
-  mode 13h - so it reaches its first graphics screen and renders black:
-  `framebuffer()` has no path that gathers a pixel's four bits across planes at
-  eight pixels to the byte. This is the next real piece of work here. (Until 2026-08-25 this entry said VGA was
+- **The CRTC is only partly honoured in the planar modes.** Geometry comes from
+  the mode number, so a program that reprograms the CRTC for a different size
+  is rendered at the BIOS size. PC Lemmings sets mode 10h (640x350) and pans by
+  writing the start address, which works, but nothing reads the horizontal or
+  vertical display-end registers back. (Until 2026-08-25 this entry said VGA was
   geometry only too. It was not - the Mode X model had been carried from Ducks
   all along, unexercised, and the note was written from a belief rather than
   from the code.)

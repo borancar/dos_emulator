@@ -1181,6 +1181,17 @@ MODE_GEOM = {0x13: (320, 200), 0x00: (320, 200), 0x01: (320, 200),
              0x0D: (320, 200),
              0x0E: (640, 200), 0x10: (640, 350), 0x12: (640, 480)}
 
+# The 16-colour planar modes: eight pixels to a byte across four planes,
+# which is a different decode from Mode X even though the planes are the same
+# memory. PC Lemmings runs in 0Dh and then 10h.
+PLANAR16_MODES = (0x0D, 0x0E, 0x10, 0x12)
+# What the BIOS leaves in the attribute controller's palette for those modes.
+# It is NOT the identity: colours 8-15 are mapped up to DAC entries 0x38-0x3F,
+# and 6 to 0x14. A program that never touches port 0x3c0 - PC Lemmings does
+# not - depends on exactly this, and with an identity map its upper eight
+# colours all come out of DAC entries it never wrote, i.e. black.
+EGA_DEFAULT_ATTR = (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
+                    0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F)
 VGA_A000 = 0xA0000
 VGA_B800 = 0xB8000
 CGA_MODES = (0x04, 0x05, 0x06)
@@ -1254,6 +1265,23 @@ class VgaDos(DosMachine):
         self.seq_index = 0
         self.chain4 = True
         self.map_mask = 0x0F
+        # Graphics Controller. Indexes 0-8: set/reset, enable set/reset,
+        # colour compare, data rotate + function, read map select, mode,
+        # miscellaneous, colour don't care, bit mask. This reset state is what
+        # the BIOS leaves after a mode set, and it is what makes the write
+        # path reduce to "store the CPU byte into the planes the map mask
+        # selects" - exactly what Mode X wants, and what this emulator did
+        # before the Graphics Controller existed here.
+        self.gc_index = 0
+        self.gc = [0, 0, 0, 0, 0, 0, 0, 0x0F, 0xFF]
+        # The four latch bytes, one per plane, loaded by any read of A000.
+        self.latches = [0, 0, 0, 0]
+        # Attribute controller palette: a 4-bit pixel indexes this and the
+        # result indexes the DAC. A program need not touch it - PC Lemmings
+        # does not - so the BIOS defaults have to be right on their own.
+        self.attr_index = 0
+        self.attr_flipflop = False
+        self.attr_pal = list(range(16))
         self.active_planes = (0, 1, 2, 3)
         self.planes = [bytearray(0x10000) for _ in range(4)]
         self.crtc = {}
@@ -1325,6 +1353,8 @@ class VgaDos(DosMachine):
         # but it fires on every single write to video memory.
         self._vidwrite_hook = self.uc.hook_add(
             UC_HOOK_MEM_WRITE, self._on_vidwrite, None, 0xA0000, 0xBFFFF)
+        self.uc.hook_add(UC_HOOK_MEM_READ, self._on_plane_read,
+                         None, VGA_A000, VGA_A000 + 0xFFFF)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self._on_plane_write,
                          None, 0xA0000, 0xAFFFF)
         # The guest reaches XMS by far-calling this stub: INT 60h services the
@@ -1414,6 +1444,20 @@ class VgaDos(DosMachine):
                 self.dac_index = (self.dac_index + 1) & 0xFF
                 self.dac_latch = []
                 self.palette_writes += 1
+        elif port == 0x3CE:                   # graphics controller index
+            self.gc_index = v & 0x0F
+            if size == 2:
+                self._gc_write(self.gc_index, (value >> 8) & 0xFF)
+        elif port == 0x3CF:                   # graphics controller data
+            self._gc_write(self.gc_index, v)
+        elif port == 0x3C0:
+            # One port alternating index and data, with the flip-flop reset
+            # by a read of the input status register at 0x3da.
+            if not self.attr_flipflop:
+                self.attr_index = v & 0x1F
+            elif self.attr_index < 16:
+                self.attr_pal[self.attr_index] = v & 0x3F
+            self.attr_flipflop = not self.attr_flipflop
         elif port == 0x3C4:
             self.seq_index = v
             if size == 2:                     # OUT dx,ax -> index+data in one
@@ -1446,6 +1490,11 @@ class VgaDos(DosMachine):
                 self.spk_div = (self.spk_div & 0x00FF) | (v << 8)
         elif port == 0x61:                    # the gate, bits 0 and 1
             self.spk_gate = v & 3
+
+    def _gc_write(self, index, v):
+        """A Graphics Controller register. Index 5 is the write mode."""
+        if 0 <= index <= 8:
+            self.gc[index] = v & 0xFF
 
     def _seq_write(self, index, v):
         if index == 0x02:                     # map mask: which planes to write
@@ -1496,6 +1545,11 @@ class VgaDos(DosMachine):
         n = self.port_in[port]
         el = self._elapsed()
         if port == 0x3DA:
+            # A read here resets the attribute controller's index/data
+            # flip-flop. Programs rely on that to resynchronise before
+            # touching 0x3c0, so it must happen even though nothing about the
+            # value returned depends on it.
+            self.attr_flipflop = False
             # Bit 3 = vertical retrace, at the ~70 Hz frame rate (wall clock, so
             # the game paces its frames correctly).
             # Bit 0 = display enable, which runs at the ~31.5 kHz HORIZONTAL
@@ -1995,6 +2049,12 @@ class VgaDos(DosMachine):
             self.uc.mem_write(0x449, bytes([self.mode]))
             self.uc.mem_write(0x463, struct.pack(
                 "<H", 0x03B4 if self.mode == 0x07 else 0x03D4))
+            # A mode set reloads the attribute controller's palette, and the
+            # 16-colour planar modes do not get an identity map. See
+            # EGA_DEFAULT_ATTR.
+            self.attr_pal = (list(EGA_DEFAULT_ATTR) if self.mode in PLANAR16_MODES
+                             else list(range(16)))
+            self.attr_flipflop = False
             if self.mode in CGA_MODES:
                 # What the BIOS leaves in the two CGA registers for each mode.
                 # Popcorn never writes 0x3d8 itself, so getting this wrong
@@ -2030,29 +2090,93 @@ class VgaDos(DosMachine):
         return
 
     # ------------------------------------------------------------ framebuffer
+    def _on_plane_read(self, uc, access, address, size, value, user):
+        """Any read of A000 loads the four latches, one byte per plane.
+
+        This is not a side effect a program tolerates - it is the mechanism.
+        Write mode 1 copies the latches straight back out, and write mode 0
+        combines them with the CPU byte under the bit mask, which is how a
+        16-colour planar blit moves pixels it never has to look at.
+        """
+        off = address - VGA_A000
+        if 0 <= off < 0x10000:
+            pl = self.planes
+            self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
+
     def _on_plane_write(self, uc, access, address, size, value, user):
         """Shadow writes to the 0xa0000 aperture into four separate planes.
 
-        In Mode X the CPU address selects a byte OFFSET and the sequencer map
-        mask selects which of the four planes receive it, so several distinct
-        pixels share one linear address. Unicorn's memory is flat and would let
-        them overwrite each other, hence this shadow copy.
+        The CPU address selects a byte OFFSET and the sequencer map mask
+        selects which planes receive it, so distinct pixels share one linear
+        address. Unicorn's memory is flat and would let them overwrite each
+        other, hence this shadow copy.
+
+        What lands in a plane is decided by the Graphics Controller. With the
+        registers in their reset state - no set/reset, function "replace",
+        bit mask 0xFF, write mode 0 - all of this reduces to storing the CPU
+        byte, which is what Mode X wants and what this did before the
+        Graphics Controller was modelled here. The rest matters for the
+        16-colour planar modes: PC Lemmings blits with write mode 1 for
+        latch copies, and write mode 0 with set/reset and a partial bit mask
+        for edges.
         """
         off = address - VGA_A000
         if off < 0 or off >= 0x10000:
             return
-        planes, active = self.planes, self.active_planes
-        if size == 1:
-            b = value & 0xFF
-            for p in active:
-                planes[p][off] = b
-        else:
-            for i in range(size):
-                b = (value >> (8 * i)) & 0xFF
-                o = off + i
-                if o < 0x10000:
-                    for p in active:
-                        planes[p][o] = b
+        for i in range(size):
+            o = off + i
+            if o < 0x10000:
+                self._plane_store(o, (value >> (8 * i)) & 0xFF)
+
+    def _plane_store(self, off, cpu):
+        """One byte through the Graphics Controller's write path."""
+        gc = self.gc
+        mode = gc[5] & 0x03
+        planes = self.planes
+        mask = self.map_mask
+        latches = self.latches
+
+        if mode == 1:
+            # Straight latch copy: bit mask and function are not consulted.
+            for p in range(4):
+                if mask & (1 << p):
+                    planes[p][off] = latches[p]
+            return
+
+        func = (gc[3] >> 3) & 0x03
+        bit_mask = gc[8]
+
+        if mode == 0:
+            rot = gc[3] & 0x07
+            data = ((cpu >> rot) | (cpu << (8 - rot))) & 0xFF if rot else cpu
+            enable = gc[1]
+            setres = gc[0]
+        elif mode == 2:
+            data = None                 # each plane is all-ones or all-zeros
+            enable = 0x0F
+            setres = cpu
+        else:                           # mode 3
+            rot = gc[3] & 0x07
+            data = ((cpu >> rot) | (cpu << (8 - rot))) & 0xFF if rot else cpu
+            bit_mask &= data            # the CPU byte narrows the bit mask
+            enable = 0x0F
+            setres = gc[0]
+
+        for p in range(4):
+            if not (mask & (1 << p)):
+                continue
+            if enable & (1 << p):
+                src = 0xFF if (setres & (1 << p)) else 0x00
+            else:
+                src = data
+            latch = latches[p]
+            if func == 1:
+                src &= latch
+            elif func == 2:
+                src |= latch
+            elif func == 3:
+                src ^= latch
+            planes[p][off] = (src & bit_mask) | (latch & ~bit_mask & 0xFF)
 
     def cga_palette(self):
         """The four (or two) colours currently displayed, as RGB triples."""
@@ -2097,6 +2221,8 @@ class VgaDos(DosMachine):
             pal = self.cga_palette()
             self.palette = pal + [(0, 0, 0)] * (256 - len(pal))
             return self.cga_framebuffer()
+        if self.mode in PLANAR16_MODES:
+            return self.planar16_framebuffer()
         if self.chain4:
             return bytes(self.uc.mem_read(VGA_A000, w * h))
         # Mode X: interleave the four planes back into linear pixels.
@@ -2124,6 +2250,47 @@ class VgaDos(DosMachine):
             print(f"  [vga] !! framebuffer {len(img)} != {w * h} "
                   f"(w={w} h={h} row_bytes={row_bytes} base={base:#x})")
             img = (bytes(img) + bytes(w * h))[:w * h]
+        return bytes(img)
+
+    def planar16_framebuffer(self):
+        """The 16-colour planar modes: eight pixels to a byte, four planes.
+
+        A pixel's value is one bit from each plane, plane 0 contributing 1 and
+        plane 3 contributing 8 - which is a different arrangement from Mode X,
+        where a whole byte in one plane is a single pixel. Same planes, same
+        map mask, different meaning, so this cannot share the Mode X decode.
+
+        The 4-bit value then goes through the attribute controller's palette
+        before it reaches the DAC. A program need not have programmed that -
+        PC Lemmings does not - so the BIOS defaults stand in.
+        """
+        w, h = self.width, self.height
+        row_bytes = self.crtc_offset * 2 if self.crtc_offset else w // 8
+        base = self.start_addr
+        pl0, pl1, pl2, pl3 = self.planes
+        attr = self.attr_pal
+        img = bytearray(w * h)
+        span = w // 8
+
+        for y in range(h):
+            src = base + y * row_bytes
+            out = y * w
+            for bx in range(span):
+                o = src + bx
+                if o >= 0x10000:
+                    break
+                b0, b1, b2, b3 = pl0[o], pl1[o], pl2[o], pl3[o]
+                if not (b0 or b1 or b2 or b3):
+                    continue                     # already zero
+                base_x = out + bx * 8
+                for bit in range(8):
+                    sh = 7 - bit
+                    v = (((b0 >> sh) & 1)
+                         | (((b1 >> sh) & 1) << 1)
+                         | (((b2 >> sh) & 1) << 2)
+                         | (((b3 >> sh) & 1) << 3))
+                    if v:
+                        img[base_x + bit] = attr[v]
         return bytes(img)
 
     def vga_state(self):
