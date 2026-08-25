@@ -198,6 +198,49 @@ If it is **hand-written assembly**, matching is not meaningfully available.
 Behavioural equivalence through differential verification is the standard, and
 every instruction is a decision someone made and worth reading as one.
 
+### The original's translation units are visible in the layout — mirror them
+
+**This decides how many `.c` files the port has, and it is not a matter of
+taste.** Compilers of the era emitted one `.OBJ` per source file, and the
+linker concatenated each module's contribution to a segment in link order,
+whole and unbroken. So:
+
+- a **contiguous run of addresses is one original source file**, and
+- **address order is source order** inside it.
+
+That is a fact about the binary you can read off, and it is the only division
+of the program that the original author actually made. Splitting the port by
+modern instinct — a file per "concern", a header per struct — throws that away
+and replaces it with something no evidence supports. It also makes every later
+question harder: "which file does image `0x3F5C` live in?" stops having an
+answer.
+
+So **mirror the translation units**. Most 1980s-90s games are one or two
+modules plus the runtime, which means the port is `game.c` and `game.h` and
+not a dozen tidy files. That looks wrong to modern eyes and is right.
+
+Finding the boundaries:
+
+- Look for **runs of call targets with no external calls into their middle**,
+  then a jump in address style — the compiler's per-module ordering breaks.
+- The **runtime library modules cluster at one end** of the segment, in the
+  linker's own order; anything after the last game routine is the C library.
+- **DGROUP contributions are laid out per module too**, so a module's statics
+  sit together and in the same relative order as its code.
+- With **hand-written assembly**, the same reasoning applies to the author's
+  `.ASM` files. If it was one file, the port is one file.
+
+Two things a port legitimately adds, and both must say so in the file header:
+
+- **An I/O boundary chosen for porting.** Splitting the hardware and DOS
+  primitives into their own file so a modern backend can replace them is a
+  boundary *you* chose, not one the binary proves. Say that in as many words.
+- **Your own backend.** The SDL layer is yours, is not a reconstruction of
+  anything, and belongs in its own file, plainly named.
+
+Do not renumber, reorder or regroup functions to read better. Keep them in
+address order and let the file look like the binary.
+
 Either way, put the finding and the evidence for it in `docs/` — and say which
 world you are in near the top of `STATUS.md`, because it sets what the project
 is aiming at.
@@ -227,10 +270,21 @@ the *top* layer. Weakening the read-only guarantee to add a feature destroys
 the reason it exists.
 
 **6. Transcribe as structured C that reads as a game.**
-Not transliterated register-shuffling. Every routine carries the address it was
-read from (`seg:off`) as a comment, so any line can be argued back to a byte in
-the binary. Where a routine genuinely cannot be written honestly as structured
-C, write it literally and say why.
+Not transliterated register-shuffling. Where a routine genuinely cannot be
+written honestly as structured C, write it literally and say why.
+
+**Every routine carries the address it was read from, as a comment on the
+function itself.** Not in a table somewhere, not only in `docs/`, not only on
+the interesting ones — on each function, every time, so any line can be argued
+back to a byte in the binary. This is the convention that decays first, because
+each individual omission is trivial and the loss is only felt later, when a
+verifier disagrees and there is no way to find the routine it disagreed about.
+A file whose functions are in address order and each labelled with that address
+can be read next to the disassembly; one without it cannot be checked at all.
+
+The same goes for transcribed *data* — a palette, a jump table, a string table
+lifted out of the executable is as much a transcription as a routine, and takes
+the same comment.
 
 **Always use `stdint` types, without exception** — `uint8_t`, `uint16_t`,
 `uint32_t`, `int16_t`, `int32_t`. Never `unsigned`, `unsigned char`, `short` or
@@ -476,8 +530,13 @@ minimum:
   and never as an optional path beside a file writer. The port shows a screen
   by default.
 - addresses are image offsets unless written `seg:off`, and every transcribed
-  routine carries the one it came from
+  routine **and every transcribed table** carries the one it came from, as a
+  comment on the thing itself
+- the port's `.c` files mirror the **original's translation units**, functions
+  in address order; any boundary you added for porting says so in its header
 - where a name or a type is a guess, say so
+- **no licence header on reconstructed code** — a provenance header naming the
+  binary instead; your own tooling is a different matter
 - the port is structured C that reads as a game, checked against the emulator
   rather than assumed
 
@@ -488,6 +547,33 @@ differently.
 Deliberate non-goals belong in the port as **no-ops with a comment saying why**,
 not as gaps waiting to be filled — and out of the verifier's dispatch, since
 comparing a no-op against the original reports a decision as a difference.
+
+## Licensing: do not stamp a licence on reconstructed code
+
+**Reconstructed routines are derived from someone else's binary, and you cannot
+licence what you do not own.** An `SPDX-License-Identifier` line is a claim of
+authorship and terms. Putting `GPL-2.0-only` — or MIT, or anything else — at
+the top of a file transcribed out of a proprietary executable asserts something
+that is not yours to assert, and it does so in a machine-readable form that
+downstream tools will believe.
+
+The split to keep:
+
+- **Your tooling is yours.** The emulator, the probes, the verifiers, the build
+  system — you wrote them, so licence them however you like, per file or with a
+  repository `LICENSE`.
+- **Reconstructed sources carry a provenance header instead of a licence.**
+  Name the binary they came from, its authors and year if known, and what the
+  file corresponds to in it — the segment, the address range. That header is
+  the useful thing anyway: it says what the file *is*.
+- **The original's licence is usually unknown**, and "abandonware" is not a
+  licence. Say so plainly in the README rather than picking one by default.
+
+This is not lawyering, it is the same discipline as the rest of the method:
+**do not assert what you have not established.** A licence header you cannot
+support is exactly the kind of confident wrong claim the rest of this document
+is about avoiding, and it is worse than a wrong function name because it
+survives being copied into other projects.
 
 ## STATUS.md, and keeping it honest
 
