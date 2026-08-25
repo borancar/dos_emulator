@@ -186,6 +186,26 @@ level editor, and nothing on disk changes.
 - XMS (`xms.py`): the INT 2Fh hook, handles and block moves - exercised by
   Ducks, which keeps its samples in extended memory and has no sound without it
 
+### Debugging a blank or wrong screen
+
+The control socket answers four questions that a screenshot cannot, added
+while getting PC Lemmings to render and kept because the next blank screen
+will want them:
+
+- `vga` - the video state: mode, geometry, the Graphics Controller, the CRTC,
+  the attribute palette, **which DAC entries are actually lit**, and a 4K map
+  of where plane data sits. A wrong palette and an empty framebuffer look
+  identical from a picture and completely different from this
+- `planes <path>` - all four plane shadows to a file, so the whole 64K can be
+  looked at rather than the window the start address points at. Rendering that
+  dump is what showed Lemmings' level and panel sitting in memory, complete,
+  in two pages - ruling out the blitter and the decode in one look
+- `screen <path>` - the decoded screen and its palette as **indices**, which is
+  what a reimplementation must be checked against; a PNG cannot carry it,
+  because two DAC entries can share a colour
+- `dump <addr> <n> <path>` - guest memory to a file, for when the thing to
+  look at is tens of kilobytes rather than a hex window
+
 ### Running unattended
 
 Wall-clock key scripting, key presses triggered by execution reaching a code

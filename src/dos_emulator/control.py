@@ -38,6 +38,10 @@ One line in, one line back, connection closes:
     text <string>         press each character of the string in turn
     snap [note]           ask the loop for a capture at its next boundary
     status                frame, mode, pending keys, CS:IP
+    dump <addr> <n> <p>   guest memory to a file, for when the thing to look
+                          at is tens of kilobytes rather than a hex window
+    screen <path>         the decoded screen and its palette, as indices -
+                          what a reimplementation is checked against
     planes <path>         dump the four plane shadows to a file - all 64K,
                           not just the window the start address points at
     vga                   the video state: mode, geometry, planes, the
@@ -317,6 +321,42 @@ class Control:
             }
             return "\n".join(f"{k} = {v}" for k, v in
                               list(st.items()) + list(extra.items()))
+        if cmd == "screen":
+            # The decoded screen and the palette it is drawn in, as raw
+            # bytes: 'SCRN', width and height as little-endian u16, 768
+            # palette bytes, then one index per pixel. A PNG cannot carry
+            # this check - two DAC entries can share a colour, and a
+            # comparison against a reimplementation needs the indices.
+            path = rest.strip()
+            if not path:
+                return "usage: screen /path/to/file"
+            try:
+                fb = m.framebuffer()
+                import struct as _st
+                with open(path, "wb") as f:
+                    f.write(b"SCRN")
+                    f.write(_st.pack("<HH", m.width, m.height))
+                    for c in m.palette:
+                        f.write(bytes(c))
+                    f.write(fb)
+            except Exception as e:
+                return f"error: {e}"
+            return f"ok: wrote {m.width}x{m.height} screen to {path}"
+        if cmd == "dump":
+            # dump <addr> <len> <path> - guest memory to a file. `read` prints
+            # a hex window; this is for the case where what you need to look at
+            # is tens of kilobytes, such as a game's own composed backbuffer.
+            parts = rest.split()
+            if len(parts) != 3:
+                return "usage: dump <addr> <len> <path>"
+            try:
+                addr = self._addr(m, parts[0])
+                n = int(parts[1], 0)
+                with open(parts[2], "wb") as f:
+                    f.write(bytes(m.uc.mem_read(addr, n)))
+            except Exception as e:
+                return f"error: {e}"
+            return f"ok: wrote {n} bytes from {addr:#07x} to {parts[2]}"
         if cmd == "planes":
             # Write the four plane shadows to a file, so all 64K of video
             # memory can be looked at rather than just the window the start
