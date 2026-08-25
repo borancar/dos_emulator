@@ -247,6 +247,37 @@ Write this rule into the project's `CLAUDE.md` at the start — see *What goes
 where* below. It is the convention most likely to be quietly dropped once the
 original context is gone.
 
+**The reconstruction's window, input and sound go through SDL3. Always.** Never
+X11, never Win32, never Cocoa, never SDL2. Not behind an `#ifdef`, not as "the
+optional viewer", not as a stopgap until something better arrives.
+
+The reason is what the port *is*. A reconstruction's whole claim is that it is
+the same game somewhere the original cannot run, and a platform-specific
+display layer quietly takes that back — it makes the port a Linux program, or a
+Windows one, that happens to contain a reconstruction. It also splits the
+verification: a viewer that only builds on one platform is a viewer that only
+gets *looked at* on one platform, and the screens nobody can open are the ones
+bugs live on the longest.
+
+Two practical corollaries:
+
+- **One display path, not two.** "Renders to a file, and optionally opens a
+  window if a display library is present" sounds cautious and is the trap: the
+  windowed path and the file path drift, and only the one your build happens to
+  take is ever checked. SDL3 is a hard dependency; the file writer is a
+  *mode* of the same composed frame, not a parallel implementation of it.
+- **The port shows a screen by default.** Running the reconstruction with no
+  arguments should open the game, not write a bitmap. A reconstruction whose
+  default output is a file is a converter; the burden of proof is to be the
+  game.
+
+Do not reach for SDL's higher-level conveniences to stand in for something the
+original did itself. The composed frame is the port's own 8-bit indexed buffer,
+built by transcribed code; SDL3 gets it to a window and hands back input, and
+that is the whole of its job. If SDL is scaling, filtering or blending
+something the original decided for itself, the port has quietly stopped being
+the reconstruction.
+
 **7. Verify differentially, per routine.**
 Stop the emulator at a routine's entry, capture the machine, let the
 **original** body run to its return, capture again. Run the C on the first
@@ -441,6 +472,9 @@ minimum:
 
 - **`stdint` types only**, with the reason — the rule alone reads as fussiness
   and gets dropped; the reason is what makes it stick.
+- **SDL3 for the window, input and sound — never a platform-specific library**,
+  and never as an optional path beside a file writer. The port shows a screen
+  by default.
 - addresses are image offsets unless written `seg:off`, and every transcribed
   routine carries the one it came from
 - where a name or a type is a guess, say so
