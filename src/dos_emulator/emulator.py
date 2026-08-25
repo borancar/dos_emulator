@@ -2175,6 +2175,13 @@ class VgaDos(DosMachine):
             self.attr_pal = (list(EGA_DEFAULT_ATTR) if self.mode in PLANAR16_MODES
                              else list(range(16)))
             self.attr_flipflop = False
+            # NOT reset here: chain4, the Graphics Controller and the latches.
+            # A BIOS mode set really does reset all three, and doing so was
+            # tried - it turned PC Lemmings' play screen black from the first
+            # frame, which says something else in this emulator depends on
+            # them surviving a mode set. Correct-looking and wrong is worse
+            # than the status quo, so it stays out until that dependency is
+            # found.
             if self.mode in CGA_MODES:
                 # What the BIOS leaves in the two CGA registers for each mode.
                 # Popcorn never writes 0x3d8 itself, so getting this wrong
@@ -2211,17 +2218,45 @@ class VgaDos(DosMachine):
 
     # ------------------------------------------------------------ framebuffer
     def _on_plane_read(self, uc, access, address, size, value, user):
-        """Any read of A000 loads the four latches, one byte per plane.
+        """A read of A000 loads the latches, and returns the selected plane.
 
-        This is not a side effect a program tolerates - it is the mechanism.
-        Write mode 1 copies the latches straight back out, and write mode 0
-        combines them with the CPU byte under the bit mask, which is how a
-        16-colour planar blit moves pixels it never has to look at.
+        Two separate things, both mechanisms rather than side effects.
+
+        The latches: write mode 1 copies them straight back out, and write
+        mode 0 combines them with the CPU byte under the bit mask, which is
+        how a planar blit moves pixels it never has to look at.
+
+        The value: writes are shadowed into four planes, but the flat memory
+        unicorn would otherwise hand back keeps only whichever byte was
+        written last, whatever plane it was for. A program that reads video
+        memory back therefore got garbage. PC Lemmings does exactly that - it
+        keeps the composed level on an offscreen page and copies it into the
+        visible one - so its terrain never appeared, while its panel, minimap
+        and sprites, which are only ever written, all drew correctly.
+
+        The hook runs before the read is satisfied, so writing the right byte
+        into flat memory here is what the guest ends up seeing. Which plane
+        that is comes from the Graphics Controller's read map select.
         """
         off = address - VGA_A000
-        if 0 <= off < 0x10000:
-            pl = self.planes
-            self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
+        if off < 0 or off >= 0x10000:
+            return
+        pl = self.planes
+        self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
+        # NOT corrected here: the value the read returns. A read of planar
+        # memory should hand back the plane the Graphics Controller's read map
+        # select names, and the flat memory unicorn returns instead keeps only
+        # whichever byte was written last. Fixing that up per read - a
+        # mem_write from inside the hook - was tried and reverted: PC Lemmings'
+        # blitter reads 553k times, and a Python round trip on each made the
+        # emulator too slow to reach its own title screen. It also turned out
+        # not to be needed for that blitter, whose `mov al, es:[di]` discards
+        # the value and exists only to load the latches.
+        #
+        # So this is a KNOWN GAP rather than an oversight. A program that
+        # genuinely reads planar memory back for its content needs it, and it
+        # wants doing in bulk - syncing a plane into flat memory when the read
+        # map select changes - not per access.
 
     def _on_plane_write(self, uc, access, address, size, value, user):
         """Shadow writes to the 0xa0000 aperture into four separate planes.
