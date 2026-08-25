@@ -1375,6 +1375,20 @@ def default_attr_palette(mode):
     if mode in (0x10, 0x12):
         return list(EGA_ATTR_HIRES)
     return list(range(16))
+def dac8(v):
+    """A 6-bit DAC value as 8 bits, the way the hardware does it.
+
+    Bit replication - the top two bits repeated into the bottom - not a
+    proportional scale. They agree at 0 and 63 and differ by one in the middle:
+    0x20 becomes 130 here and 129 if you compute v*255/63. That one is enough
+    to make every mid-tone pixel of a screen compare as different against
+    DOSBox, which turned a cross-check of PC Lemmings' level into noise and
+    hid what it was supposed to measure.
+    """
+    v &= 0x3F
+    return (v << 2) | (v >> 4)
+
+
 VGA_A000 = 0xA0000
 VGA_B800 = 0xB8000
 CGA_MODES = (0x04, 0x05, 0x06)
@@ -1630,7 +1644,7 @@ class VgaDos(DosMachine):
         elif port == 0x3C9:                   # DAC data: R, G, B (6-bit)
             self.dac_latch.append(v & 0x3F)
             if len(self.dac_latch) == 3:
-                r, g, b = (c * 255 // 63 for c in self.dac_latch)
+                r, g, b = (dac8(c) for c in self.dac_latch)
                 self.palette[self.dac_index & 0xFF] = (r, g, b)
                 self.dac_index = (self.dac_index + 1) & 0xFF
                 self.dac_latch = []
@@ -2347,15 +2361,14 @@ class VgaDos(DosMachine):
             for i in range(count):
                 r, g, b = blob[i * 3:i * 3 + 3]
                 idx = (first + i) & 0xFF
-                self.palette[idx] = (r * 255 // 63, g * 255 // 63,
-                                     b * 255 // 63)
+                self.palette[idx] = (dac8(r), dac8(g), dac8(b))
             self.palette_writes += count
         elif ah == 0x10 and al == 0x10:       # set single DAC register
             idx = self._reg(UC_X86_REG_BX) & 0xFF
             self.palette[idx] = (
-                ((self._reg(UC_X86_REG_DX) >> 8) & 0x3F) * 255 // 63,
-                (self._reg(UC_X86_REG_CX) >> 8 & 0x3F) * 255 // 63,
-                (self._reg(UC_X86_REG_CX) & 0x3F) * 255 // 63)
+                dac8((self._reg(UC_X86_REG_DX) >> 8) & 0x3F),
+                dac8((self._reg(UC_X86_REG_CX) >> 8) & 0x3F),
+                dac8(self._reg(UC_X86_REG_CX) & 0x3F))
             self.palette_writes += 1
         return
 

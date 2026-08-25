@@ -97,6 +97,14 @@ level editor, and nothing on disk changes.
   bit mask. In their reset state these reduce to "store the CPU byte in the
   planes the map mask selects", which is exactly what Mode X wants - so Mode X
   goes through the same path unchanged
+- **6-bit DAC values become 8-bit by bit replication** - `(v << 2) | (v >> 4)`,
+  the top two bits repeated into the bottom - not by a proportional
+  `v * 255 / 63`. The two agree at 0 and 63 and differ by one in between:
+  0x20 is 130 the right way and 129 the wrong way. That one is enough to make
+  **every mid-tone pixel** of a screen compare as different against DOSBox,
+  which turned a cross-check of PC Lemmings' level into noise: the same
+  comparison went from 59.59% to 79.15% when this was corrected, with nothing
+  else changed
 - **the attribute controller** at 0x3c0, its index/data flip-flop and the reset
   of that flip-flop by a read of 0x3da. Its 16-entry palette maps a pixel to a
   DAC entry, and the BIOS default is **not** the identity **and not the same
