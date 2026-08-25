@@ -118,9 +118,43 @@ exist. The reconstruction must stay **clean-room**, so:
   project a port of that source rather than a reverse-engineering one, which is
   a different claim to make about the result.
 
-**2. Recover the executable, and prove the recovery.**
-Most DOS-era binaries are packed (EXEPACK, LZEXE, PKLITE). Run the unpacking
-stub under an emulator rather than reimplementing it — stubs rely on real 8086
+**2. Pick the one binary worth reconstructing, recover it, and prove the
+recovery.**
+A DOS game often shipped a *separate executable per display adapter* — a CGA
+one, an EGA/VGA one, a Tandy one — dispatched by a launcher that autodetects
+the hardware. **Reconstruct exactly one of them.** The game logic is the same
+in all of them; only the presentation layer differs, so a second variant
+re-derives the level format, the entity handlers and the main loop for no gain,
+and doubles the surface that every later verification sweep has to cover.
+
+Prefer, in this order:
+
+- **VGA** — the best-looking build, so the port a player actually wants is
+  also the one worth proving. If it uses mode 13h you get a bonus: linear and
+  *chunky*, one byte per pixel, no planes and no latches, so a blitter
+  transcribes as ordinary array writes and a frame check is a byte-for-byte
+  compare. **Do not assume it does.** Plenty of "VGA" builds are 16-colour
+  planar mode 0Dh and differ from the EGA build only in palette width — PC
+  Lemmings is one, and its VGA executable serves both adapters from one menu.
+  Check which mode the game actually sets before promising yourself a cheap
+  frame comparison.
+- **EGA** — 16 colours across four *bit-planes*, reached through the Graphics
+  Controller's latches, map mask and bit mask. Every blit is a state machine in
+  the video hardware as much as in the code, so the emulator has to model that
+  hardware faithfully before any comparison means anything.
+- **CGA** — last. Two bits per pixel in two interleaved half-frame banks, with
+  the fixed palettes. The addressing is the most awkward of the three and the
+  result is the least worth having.
+
+Take a lower one only when the higher one was not shipped, or when the game is
+*only* interesting in it. Note that the ordering is about which *result* is
+worth having, not which is least work: a planar VGA build is more work than a
+chunky one and still the right target. Say in `STATUS.md` which variant the port is of, and
+list the others as deliberate non-goals rather than leaving them looking
+unfinished.
+
+Then the recovery itself. Most DOS-era binaries are packed (EXEPACK, LZEXE,
+PKLITE). Run the unpacking stub under an emulator rather than reimplementing it — stubs rely on real 8086
 behaviour, notably the 1 MB address wrap, so load at a high segment to
 reproduce it. Then *prove* it: round-trip the emitted EXE against the stub's
 own output. An unpack that is subtly wrong poisons everything downstream and

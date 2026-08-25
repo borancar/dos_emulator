@@ -16,6 +16,7 @@ Updated 2026-08-25.
 | **POPGEN** (Popcorn's level editor) | text mode 03h, BIOS keyboard via INT 16h, INT 21h AH=19h/47h | ran unmodified the first time; its file formats were measured through it |
 | **POPSPEED** (Popcorn's speed utility) | INT 21h AX=2568h and nothing else | trivial - sets an interrupt vector and exits |
 | **Ducks** (Furnish / Hungry Software, 1998-2000) | VGA mode 13h switched to Mode X - planar writes through the map mask, the CRTC start address, the DAC; Sound Blaster 8-bit auto-init DMA on IRQ 5; XMS; the BIOS keyboard and port 0x60; INT 33h mouse; the control socket | the project the VGA, Sound Blaster, XMS, directory-service and control-socket code come from. Rebased onto this emulator on 2026-08-25: its own port's checks ran unchanged through it - the snapshot-replay comparison of its natives against the original, and its C-against-guest tests - and `Ducks.unpacked.exe` runs here from the README through the splash to the menu and its demo level, with the DAC, planar and DMA paths live. See the Ducks repository's STATUS.md for the numbers |
+| **PC Lemmings** (DMA Design / Psygnosis, 1991; the 10-level demo build) | PKLITE recovery at a realistic load segment, the BIOS CRTC-base variable at 0040:0063, and an interrupt gate that clears TF - the game single-steps itself to decrypt its own code | start-up only, as of 2026-08-25: it clears both machine-type menus, enters BIOS mode 0Dh and opens `main.dat` and `adlib.dat`. **Nothing is drawn** - mode 0Dh is not rendered (see *Known gaps*) - and no routine has been transcribed or checked |
 | **PickEggs** (Ducks' egg selector) | text mode 03h, INT 21h AH=1Ah/3Bh/47h/4Eh/4Fh - a directory browser | its file-operation log and its screen came out byte-identical to the Ducks project's own emulator on 2026-08-25 |
 
 Popcorn is the reason most of this exists, and it is why the CGA and PC-speaker
@@ -31,6 +32,17 @@ not needed yet should be treated as untested, however plausible it looks.
   and an environment block with the program's own path in it
 - EXE loading with relocation; EXEPACK'd binaries are recovered separately and
   run as plain EXEs
+- **The load segment is settable** - `DosMachine(psp_seg=, env_seg=)` and
+  `--psp-seg`. The default is still 0x0100, which is far lower than real DOS
+  ever loads a program, and a packer stub doing signed segment arithmetic can
+  tell: PC Lemmings' PKLITE stub forms `psp + 0x834` and then subtracts 0x1000
+  from it, which at 0x100 borrows below zero, puts DS at 0xF934 and sends DS:SI
+  past the 1 MB mark. It decompressed zeros and its relocation walker ran off
+  the end of memory. `--psp-seg 0x1000` is what a real DOS would have given it
+- **An interrupt gate clears TF and IF** after pushing the flags, as the CPU
+  does. PC Lemmings sets the trap flag and decrypts itself one instruction at a
+  time from an INT 01h handler; entering that handler with TF still set made it
+  single-step itself, so IP never moved and the stack grew until the run died
 
 ### DOS (INT 21h)
 
@@ -77,6 +89,12 @@ level editor, and nothing on disk changes.
   read pixel), 0Fh (mode query), 10h/10h and 10h/12h (DAC registers). The
   text ones are what Ducks' README screen and PickEggs draw with
 - mode geometry known for 00h, 01h, 04h, 05h, 06h, 0Dh, 0Eh, 10h, 12h and 13h
+- the BIOS data area carries the video mode at 0040:0049 and **the CRTC's base
+  I/O port at 0040:0063** (0x3D4, or 0x3B4 in mode 07h), both kept in step
+  across a mode set. A program that wants the retrace bit reads the base from
+  there rather than assuming one, and then polls base+6 - PC Lemmings does
+  exactly that, and with 0040:0063 left at zero it polled *port 6* twenty-six
+  million times waiting for a bit that could never arrive
 
 ### Input
 
@@ -116,11 +134,14 @@ on before pressing replaced the wall-clock scripts that missed.
 
 ## Known gaps
 
-- **EGA is geometry only.** The planar model is Mode X's - four planes of
-  mode 13h pixels selected by the map mask. The 16-colour planar modes (0Dh,
-  0Eh, 10h, 12h) with the graphics controller's write modes, bit masks and
-  the attribute controller's palette are not modelled; the first game that
-  needs them will have to add them. (Until 2026-08-25 this entry said VGA was
+- **EGA is geometry only, and a game now needs it.** The planar model is Mode
+  X's - four planes of mode 13h pixels selected by the map mask. The 16-colour
+  planar modes (0Dh, 0Eh, 10h, 12h) with the graphics controller's write modes,
+  bit masks and the attribute controller's palette are not modelled.
+  **PC Lemmings runs in mode 0Dh** - its "VGA" build is 16-colour planar, not
+  mode 13h - so it reaches its first graphics screen and renders black:
+  `framebuffer()` has no path that gathers a pixel's four bits across planes at
+  eight pixels to the byte. This is the next real piece of work here. (Until 2026-08-25 this entry said VGA was
   geometry only too. It was not - the Mode X model had been carried from Ducks
   all along, unexercised, and the note was written from a belief rather than
   from the code.)

@@ -71,6 +71,19 @@ def set_game_dir(path):
     was, GAME_DIR = GAME_DIR, os.path.abspath(path)
     return was
 MEM_SIZE = 0x200000
+# Where a program is loaded, by default. These are *defaults*, not the only
+# possible values: DosMachine takes psp_seg/env_seg, and a game that needs a
+# realistic load address passes one.
+#
+# 0x0100 is far lower than real DOS ever loads a program - DOS itself, its
+# buffers and any drivers sit below the first free block, so a real PSP is
+# typically 0x0800-0x2000. That difference is invisible to most programs and
+# fatal to some: PC Lemmings is packed with PKLITE, whose stub forms a source
+# segment as `psp + 0x834` and then subtracts 0x1000 from it with `sub bh,0x10`.
+# At a realistic load address that subtraction is an ordinary one; at 0x0100 it
+# borrows below zero, the segment becomes 0xF934, and DS:SI addresses past the
+# 1 MB mark instead of the compressed data. The stub then "decompresses" zeros
+# and its relocation walker runs off the end of memory. See --psp-seg.
 PSP_SEG = 0x0100
 ENV_SEG = 0x00F0
 
@@ -141,10 +154,15 @@ class Handle:
 
 class DosMachine:
     def __init__(self, exe_path, blaster=False, verbose=True,
-                 max_insns=80_000_000, cmdline=""):
+                 max_insns=80_000_000, cmdline="", psp_seg=None, env_seg=None):
         self.verbose = verbose
         self.cmdline = cmdline
         self.max_insns = max_insns
+        # The segment the PSP goes at, and the image 0x10 paragraphs above it.
+        # Defaults preserve the historical layout exactly; a game whose packer
+        # stub does signed segment arithmetic needs a realistic one instead.
+        self.psp_seg = PSP_SEG if psp_seg is None else psp_seg
+        self.env_seg = (self.psp_seg - 0x10) if env_seg is None else env_seg
         # What the guest thinks it was started as - DOS puts this at the end
         # of the environment block, and it is a program's argv[0].
         self.prog_path = "C:\\" + os.path.basename(exe_path).upper()
@@ -164,7 +182,7 @@ class DosMachine:
         # The Disk Transfer Area, where find-first/find-next leave their
         # result. DOS defaults it to PSP:0080, and a program that never calls
         # AH=1Ah is relying on exactly that.
-        self.dta = (PSP_SEG, 0x80)
+        self.dta = (self.psp_seg, 0x80)
         # The guest's current directory, as a GAME_DIR-relative DOS path with
         # backslashes; "" is the root. Every path the guest names is resolved
         # against this, so chdir (AH=3Bh) is the one place it changes.
@@ -203,6 +221,12 @@ class DosMachine:
         self.uc.mem_write(0x413, struct.pack("<H", 640))      # KB of RAM
         self.uc.mem_write(0x449, bytes([0x03]))               # video mode
         self.uc.mem_write(0x44A, struct.pack("<H", 80))       # columns
+        # 0040:0063 - the CRTC's base I/O port, 0x3D4 on a colour adapter and
+        # 0x3B4 on a mono one. A program that wants the retrace bit reads this
+        # rather than assuming, and then polls base+6 (0x3DA). PC Lemmings
+        # does exactly that, and with this left at 0 it spun on port 6 for
+        # tens of millions of reads waiting for a bit that could never arrive.
+        self.uc.mem_write(0x463, struct.pack("<H", 0x03D4))
         self.uc.mem_write(0x46C, struct.pack("<I", 0x00010000))  # tick count
 
         env = b"COMSPEC=C:\\COMMAND.COM\x00PATH=C:\\\x00"
@@ -211,20 +235,20 @@ class DosMachine:
         # The environment block ends with a word count and the program's own
         # path, which is where a DOS program finds argv[0].
         env += b"\x00\x01\x00" + self.prog_path.encode("ascii", "replace") + b"\x00"
-        self.uc.mem_write(ENV_SEG * 16, env)
+        self.uc.mem_write(self.env_seg * 16, env)
 
         psp = bytearray(0x100)
         psp[0:2] = b"\xcd\x20"
         struct.pack_into("<H", psp, 0x02, 0x9000)
-        struct.pack_into("<H", psp, 0x2C, ENV_SEG)
+        struct.pack_into("<H", psp, 0x2C, self.env_seg)
         psp[0x50:0x53] = b"\xcd\x21\xcb"
         tail = (" " + self.cmdline).encode("latin1") if self.cmdline else b""
         psp[0x80] = len(tail)
         psp[0x81:0x81 + len(tail)] = tail
         psp[0x81 + len(tail)] = 0x0D
-        self.uc.mem_write(PSP_SEG * 16, bytes(psp))
+        self.uc.mem_write(self.psp_seg * 16, bytes(psp))
 
-        self.load_seg = PSP_SEG + 0x10
+        self.load_seg = self.psp_seg + 0x10
         base = self.load_seg * 16
         self.uc.mem_write(base, image)
         for i in range(crlc):
@@ -237,11 +261,11 @@ class DosMachine:
         self.uc.reg_write(UC_X86_REG_IP, ip)
         self.uc.reg_write(UC_X86_REG_SS, (self.load_seg + ss) & 0xFFFF)
         self.uc.reg_write(UC_X86_REG_SP, sp)
-        self.uc.reg_write(UC_X86_REG_DS, PSP_SEG)
-        self.uc.reg_write(UC_X86_REG_ES, PSP_SEG)
+        self.uc.reg_write(UC_X86_REG_DS, self.psp_seg)
+        self.uc.reg_write(UC_X86_REG_ES, self.psp_seg)
         self.uc.reg_write(UC_X86_REG_AX, 0)
         self.uc.reg_write(UC_X86_REG_CX, 0xFF)
-        self.uc.reg_write(UC_X86_REG_DX, PSP_SEG)
+        self.uc.reg_write(UC_X86_REG_DX, self.psp_seg)
         self.start = (self.load_seg + cs) * 16 + ip
 
     # ----------------------------------------------------------------- utils
@@ -352,6 +376,17 @@ class DosMachine:
             sp = (sp - 2) & 0xFFFF
             self.uc.mem_write(ss * 16 + sp, struct.pack("<H", val))
         self._set(UC_X86_REG_SP, sp)
+        # An interrupt gate clears TF and IF *after* pushing the flags, and
+        # both matter. TF especially: PC Lemmings sets the trap flag and
+        # decrypts itself one instruction at a time from an INT 01h handler
+        # (a rolling XOR keyed on the preceding word, with a 0xCC check for
+        # breakpoints). Entering that handler with TF still set makes it
+        # single-step itself - the handler re-enters on its own first
+        # instruction, IP never moves, and the stack grows until the run dies.
+        # Clearing IF is the same rule and stops a guest ISR being re-entered
+        # before it has had a chance to `cli` or `iret`.
+        self.uc.reg_write(UC_X86_REG_EFLAGS,
+                          self.uc.reg_read(UC_X86_REG_EFLAGS) & ~0x300)
         self.uc.reg_write(UC_X86_REG_CS, seg)
         self.uc.reg_write(UC_X86_REG_IP, off)
         self.guest_dispatch[intno] += 1
@@ -662,7 +697,7 @@ class DosMachine:
         # accepted-and-ignored call leaves DX holding whatever it held before.
         if ah in (0x49, 0x4A, 0x33, 0x38, 0x0B, 0x62):
             if ah == 0x62:
-                self._set(UC_X86_REG_BX, PSP_SEG)
+                self._set(UC_X86_REG_BX, self.psp_seg)
             if ah == 0x0B:
                 self._set(UC_X86_REG_AX, 0)
             return
@@ -1844,6 +1879,12 @@ class VgaDos(DosMachine):
             self.video_modes.append(self.mode)
             self.width, self.height = MODE_GEOM.get(self.mode, (320, 200))
             self.text_mode = self.mode in (0x00, 0x01, 0x02, 0x03, 0x07)
+            # The BIOS keeps 0040:0049 and 0040:0063 in step with the mode, and
+            # a program that reads the CRTC base out of the data area rather
+            # than assuming one will follow it across a mode set.
+            self.uc.mem_write(0x449, bytes([self.mode]))
+            self.uc.mem_write(0x463, struct.pack(
+                "<H", 0x03B4 if self.mode == 0x07 else 0x03D4))
             if self.mode in CGA_MODES:
                 # What the BIOS leaves in the two CGA registers for each mode.
                 # Popcorn never writes 0x3d8 itself, so getting this wrong
@@ -2253,6 +2294,12 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                     help="image offset of the code segment, for --break-at")
     ap.add_argument("--cmdline", default="",
                     help="DOS command tail: the level file to load, e.g. poptab")
+    ap.add_argument("--psp-seg", type=lambda v: int(v, 0), default=None,
+                    metavar="SEG",
+                    help="segment to load the program at (default 0x100). A "
+                         "packer stub that does signed segment arithmetic - "
+                         "PKLITE does - needs a realistic DOS load address "
+                         "such as 0x1000, or it addresses past 1 MB")
     ap.add_argument("--scale", type=int, default=3)
     ap.add_argument("--blaster", action="store_true")
     ap.add_argument("--chunk", type=int, default=20_000,
@@ -2333,7 +2380,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
         m = make_machine(args)
     else:
         m = VgaDos(args.program, blaster=args.blaster, max_insns=1 << 62,
-                   cmdline=args.cmdline)
+                   cmdline=args.cmdline, psp_seg=args.psp_seg)
     audio = None
     if args.blaster and not args.no_audio and not headless:
         audio = AudioSink()
