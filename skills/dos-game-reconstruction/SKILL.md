@@ -340,6 +340,20 @@ which makes the game's speed a property of the machine rather than of the game.
 
 ## Traps that cost real time
 
+- **Check the reference against a second reference before believing a score.**
+  A comparison that lands near its own noise floor is more often a broken
+  instrument than a broken result. PC Lemmings' level scored 59.59% against
+  DOSBox and 81% against our own emulator; the gap was not the port at all but
+  a **6-bit DAC expanded the wrong way** — `v * 255 / 63` instead of the
+  hardware's bit replication `(v << 2) | (v >> 4)`. They agree at 0 and 63 and
+  differ by one in the middle, so every mid-tone pixel compared as different.
+  Correcting it moved the same comparison to 79.15% and made the two
+  references agree with each other, which is what finally showed the residual
+  difference was real.
+- **Know your noise floor.** Two unrelated renderings of the same level agreed
+  on ~58% of pixels simply because a few colours dominate. A score is only
+  evidence to the extent it sits above that, so measure the floor — compare
+  something deliberately wrong — before reading anything into a percentage.
 - **When an instrument disagrees with an established fact, suspect the
   instrument first.** Reading an *image* offset in a *file* forgets the EXE
   header in front of it; the resulting garbage looks exactly like a discovery.
