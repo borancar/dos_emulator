@@ -434,6 +434,64 @@ Once the rate is known, pace on an **absolute clock**, not on emulated delays.
 A sleep of a fraction of a millisecond is at the mercy of the host scheduler,
 which makes the game's speed a property of the machine rather than of the game.
 
+## When the picture disagrees, read the registers — do not fit models
+
+The single most expensive mistake available in this work: the port draws a
+screen, it is *nearly* right, and you start proposing rules that would explain
+the difference. Keyed or opaque? A shadow? A mask? An outline? Each one is
+cheap to test, each scores 93-96%, and none of them is the answer, because the
+answer is not a rule about pixels — it is what the original's blitter actually
+programmed into the hardware.
+
+A reconstruction of PC Lemmings spent **three sessions and seven models** on a
+black halo around its menu sprites, plateauing at 96.42%. Recording the guest's
+writes to the EGA sequencer and graphics controller — 32,806 of them in one
+screen — then attributing each write into the affected rows to the
+**instruction** that made it, found the cause in one pass: a second sprite, the
+same size as the first, blitted ten rows lower in black. A drop shadow.
+
+So when a composed screen is nearly right:
+
+1. **Log the video-hardware writes.** Map mask, enable set/reset, write mode,
+   bit mask. These say opaque or masked, and which planes are even involved.
+2. **Attribute writes to the destination by instruction.** "What wrote this
+   pixel?" is answerable and "what rule explains this pixel?" is not. Two
+   different sprites landing in one region look like one strange sprite.
+3. **Only then reason about compositing.**
+
+A model that fits at 96% is not nearly right. It is wrong, and the shape of
+the wrongness is telling you a second thing is being drawn.
+
+### Sprites are not all composited the same way
+
+Expect **both** in the same screen, and expect the choice to follow from what
+the sprite is *for*:
+
+- **Keyed** (index 0 transparent) is the default for artwork that sits on a
+  background.
+- **Opaque** — its own black included — for anything that must **erase** what
+  it replaces. A label that swaps between two words, a rating name that cycles,
+  an input field the player types into. If a sprite can change without the
+  screen being redrawn, it is almost certainly opaque, and keying it out leaves
+  the background showing through where the original has black.
+
+Testing both costs a minute and settles it. Assuming one rule for the whole
+screen cost this port four separate rounds.
+
+### Blit sources point at scratch buffers
+
+A game drawing at a **non-byte-aligned x** cannot just blit: it copies the
+artwork into a scratch buffer and shifts the whole buffer right one bit at a
+time (`shr`, then `rcr` down the bytes, repeated per bit), then blits that
+byte-aligned. PC Lemmings does this at image `0x09360`.
+
+So following a blit's source address lands on **anonymous memory**, not on
+artwork, and it will do so every time. Three separate mysteries in that port —
+a background "generated at run time", a bar of "solid fills", a font that was
+"nowhere in any file" — were the same scratch buffer seen three times. The move
+is to find what writes *into* the buffer, one step further back, and probe
+*those* sources against the data files.
+
 ## Traps that cost real time
 
 - **A "known gap" you argued away is the most expensive kind.** Writing a gap
@@ -469,7 +527,28 @@ which makes the game's speed a property of the machine rather than of the game.
 - **Calibrating against the port measures the port.** See timing above.
 - **A stale output file reads as a successful run.** Delete the target before a
   capture, and check the exit status — a crashed run leaves yesterday's file
-  sitting there looking plausible.
+  sitting there looking plausible. **Engineer against this rather than
+  remembering it**: the tool that compares should regenerate what it compares,
+  with no flag to skip. One port wrote that warning down twice and still lost
+  three measurements to it — plates that "matched 18%" and in fact matched 93%,
+  and a 100% proof that read 83.65% because the capture predated the fix.
+- **Map a residual before explaining it.** "The rest is animation" is a guess,
+  and counting the difference *by band* rather than in total is what disproves
+  it. One port wrote off 10,740 differing pixels that way; bucketing them by
+  16-row band showed every band carrying a few at one screen edge — a
+  background drawn 640 pixels wide where the original drew 632. That single
+  fix took another screen to pixel-exact. **Check whether the residual is
+  static**, too: if it does not move between two captures, it is not animation,
+  whatever it looks like.
+- **A negative search proves nothing without a positive control.** "I searched
+  every data file and the artwork is not there" is only evidence if the same
+  search finds something you know *is* there. Run both in the same breath and
+  report both numbers — 0 matches against 298 for a known-stored control is an
+  argument; 0 matches alone is a search that might simply be broken.
+- **A simulation that disagrees with reality by an order of magnitude is a bug
+  in the simulation.** Not a finding about the original. Sanity-check it
+  against a case you already know before believing what it says about one you
+  do not.
 - **Judge a capture against what it should look like, not against a proxy.**
   "Wait until the screen is bright" sounds like the guest's own cue and is
   not: a palette fade passes through intermediate tables whose peak component
