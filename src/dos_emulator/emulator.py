@@ -1096,12 +1096,16 @@ class VgaDos(DosMachine):
     # the rule (Ducks writes saves through) can say so in the same place.
     fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
 
-    def __init__(self, exe, blaster=False, vsync_hz=60.0, **kw):
+    def __init__(self, exe, blaster=False, vsync_hz=60.0,
+                 port60_releases=False, **kw):
         # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
         # CGA, which is what Popcorn was written for and paces on. A VGA
         # refreshes its 200-line modes at 70 Hz, and a game that paces on the
         # retrace - Ducks does - runs a sixth slow at the CGA rate.
         self.vsync_hz = vsync_hz
+        # Whether a key release on the BIOS path shows on port 0x60 as a
+        # break code. See press_key.
+        self.port60_releases = port60_releases
         self.palette = [(0, 0, 0)] * 256
         self.dac_index = 0
         self.dac_phase = 0
@@ -1466,12 +1470,18 @@ class VgaDos(DosMachine):
         code = scancode if down else (scancode | 0x80)
         if self.guest_owns_keyboard():
             self.scan_queue.append((code, ascii_))
-        else:
-            if down:
-                self.key_buf.append((scancode, ascii_))
-            # Port 0x60 shows the last transition either way. A program on
-            # the BIOS path may still read it for key-up - Ducks does - and a
-            # release that never arrives there is a key held down forever.
+        elif down:
+            self.key_buf.append((scancode, ascii_))
+            self.last_scancode = code
+        elif self.port60_releases:
+            # A program on the BIOS path may still read port 0x60 for key-up
+            # - Ducks does - and a release that never arrives there is a key
+            # held down forever. Opt-in rather than the default, because it
+            # changes what every BIOS-path program sees on the port: a driver
+            # that presses and releases in one instant leaves a break code
+            # there where the old behaviour left the make code. Popcorn's
+            # sweep showed no difference either way (2026-08-25), but the
+            # rule is that a default does not move without a reason to.
             self.last_scancode = code
 
     def service_keyboard(self):

@@ -84,7 +84,11 @@ level editor, and nothing on disk changes.
   scan codes off port 0x60 work, not only those that call the BIOS. Which path
   a key takes is decided from the live interrupt vector, per key, because a
   program may switch during a session
-- BIOS keyboard through INT 16h AH=00h/01h/10h/11h
+- BIOS keyboard through INT 16h AH=00h/01h/10h/11h. Port 0x60 shows the
+  last make code on this path; whether it also shows releases is
+  `VgaDos(port60_releases=)`, off by default because it changes what a
+  BIOS-path program sees there. Ducks reads the port for key-up and turns
+  it on; Popcorn's sweep is the same with it on or off
 - INT 33h mouse: reset, show and hide cursor, read position and buttons
 
 ### Sound
