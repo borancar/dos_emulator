@@ -526,6 +526,65 @@ Both of those cost a full round each, and in both the image would have shown
 it immediately. Make the three-image dump the *first* thing you do with a
 difference, not the last.
 
+### Building it
+
+One tool per project, because only the two file formats are project-specific.
+`tools/diff_png.py` in the PC Lemmings reconstruction is the worked example:
+
+```
+uv run python tools/diff_png.py --capture out/menu.scrn --raw out/port.raw \
+    --name out/menu [--rows Y0 Y1] [--cols X0 X1] [--scale N]
+
+  region 640x78 at (0,0)
+  differing : 114 of 49920  (99.77% agree)
+    out/menu-original.png
+    out/menu-port.png
+    out/menu-diff.png
+```
+
+Four things about it are worth copying rather than reinventing:
+
+- **Write PNG from the standard library.** No Pillow, no numpy — a
+  reconstruction's whole claim is that its measurements are reproducible, and
+  a picture-drawing dependency is a poor thing to stake that on. The entire
+  encoder:
+
+  ```python
+  def write_png(path, w, h, rows):          # rows: h bytearrays of 3*w, RGB
+      raw = bytearray()
+      for r in rows:
+          raw.append(0)                     # filter type 0
+          raw += r
+      def chunk(tag, data):
+          return (struct.pack(">I", len(data)) + tag + data
+                  + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+      with open(path, "wb") as f:
+          f.write(b"\x89PNG\r\n\x1a\n")
+          f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+          f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 9)))
+          f.write(chunk(b"IEND", b""))
+  ```
+
+- **Each side through its own palette.** The capture carries the guest's DAC;
+  the port carries its own table. Convert both to RGB independently. Sharing
+  one palette hides exactly the class of bug where the port's colours are
+  wrong, and that class is common.
+
+- **Compare indices, colour the diff.** Decide "differs" on the palette
+  *index*, not the RGB — two different indices can share a colour, and you
+  want to see that. Then draw the difference in a colour the game cannot
+  produce (magenta on a 16-colour EGA palette) and dim the agreement, so the
+  eye goes straight to the residue while the surrounding shape still reads.
+
+- **Crop and scale.** `--rows 0 77 --scale 2` on a 39-row strip shows a
+  one-pixel row offset that is invisible in a 640×350 thumbnail. Print the
+  region and the count alongside, so the image and the number are never
+  reported apart.
+
+Nearest-neighbour scaling only, and never smooth or resample: the point is to
+see individual pixels, and an interpolated diff image is a lie about which
+ones differ.
+
 ## Traps that cost real time
 
 - **A check at one value of a parameter says nothing about the parameter.**
