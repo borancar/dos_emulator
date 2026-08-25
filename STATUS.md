@@ -105,6 +105,14 @@ level editor, and nothing on disk changes.
   which turned a cross-check of PC Lemmings' level into noise: the same
   comparison went from 59.59% to 79.15% when this was corrected, with nothing
   else changed
+- **VGA read modes 0 and 1.** A read of planar memory returns the plane the
+  read map select names, or - in read mode 1 - one bit per pixel saying
+  whether that pixel matches the colour-compare register, considering only the
+  planes colour-don't-care selects. Both matter: PC Lemmings' terrain blitter
+  reads video memory in read mode 1 and turns the answer into the Graphics
+  Controller's bit mask, which is how it implements "do not overwrite". With
+  flat memory returned instead, its composed level came out with exactly the
+  right shape and the wrong colours in 14 883 pixels
 - **the attribute controller** at 0x3c0, its index/data flip-flop and the reset
   of that flip-flop by a read of 0x3da. Its 16-entry palette maps a pixel to a
   DAC entry, and the BIOS default is **not** the identity **and not the same
@@ -244,15 +252,7 @@ on before pressing replaced the wall-clock scripts that missed.
 
 ## Known gaps
 
-- **A read of planar memory returns flat memory, not the selected plane.**
-  Writes are shadowed into four planes; reads are not corrected, so what comes
-  back is whichever byte was written to that address last, for whatever plane.
-  A program that reads video memory back for its *content* would get garbage.
-  Nothing has been shown to need it yet - see the retraction below - and the
-  cheap fix is not cheap: correcting per access with a `mem_write` from inside
-  the read hook made the emulator too slow to reach PC Lemmings' title screen
-  at all. It wants doing in **bulk**, syncing a plane into flat memory when
-  the read map select changes.
+
 - **Resetting chain4, the Graphics Controller and the latches on a BIOS mode
   set** - which real hardware does - turns PC Lemmings' play screen black from
   the first frame. Something here depends on them surviving a mode set. Left

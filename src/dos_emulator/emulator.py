@@ -2399,20 +2399,38 @@ class VgaDos(DosMachine):
             return
         pl = self.planes
         self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
-        # NOT corrected here: the value the read returns. A read of planar
-        # memory should hand back the plane the Graphics Controller's read map
-        # select names, and the flat memory unicorn returns instead keeps only
-        # whichever byte was written last. Fixing that up per read - a
-        # mem_write from inside the hook - was tried and reverted: PC Lemmings'
-        # blitter reads 553k times, and a Python round trip on each made the
-        # emulator too slow to reach its own title screen. It also turned out
-        # not to be needed for that blitter, whose `mov al, es:[di]` discards
-        # the value and exists only to load the latches.
+        # The VALUE a read returns, which unicorn would otherwise take from
+        # flat memory - where only the last byte written to that address
+        # survives, for whatever plane it belonged to.
         #
-        # So this is a KNOWN GAP rather than an oversight. A program that
-        # genuinely reads planar memory back for its content needs it, and it
-        # wants doing in bulk - syncing a plane into flat memory when the read
-        # map select changes - not per access.
+        # This was once dismissed here as a gap that no game needed, on the
+        # grounds that PC Lemmings' blitter does `mov ah, es:[di]` and throws
+        # the value away. It does not throw it away. Two instructions later it
+        # is `not ah` and then `out dx, ax` into the Graphics Controller's bit
+        # mask: the value read IS the "do not overwrite" mask, and the read is
+        # made in READ MODE 1, colour compare, so what it should return is one
+        # bit per pixel saying "does this pixel already match colour 8", i.e.
+        # is there terrain here already. Returning flat memory instead handed
+        # the game a garbage mask, and its composed level came out with the
+        # right shape and the wrong colours - which read as a fault in the
+        # reimplementation being checked against it.
+        if self.chain4 and self.mode not in PLANAR16_MODES:
+            return
+        gc = self.gc
+        if gc[5] & 0x08:
+            # Read mode 1: each bit answers whether that pixel equals the
+            # colour compare register, considering only the planes the
+            # colour-don't-care register selects.
+            cc, dc = gc[2] & 0x0F, gc[7] & 0x0F
+            v = 0xFF
+            for p in range(4):
+                if dc & (1 << p):
+                    want = 0xFF if (cc & (1 << p)) else 0x00
+                    v &= ~(pl[p][off] ^ want) & 0xFF
+        else:
+            # Read mode 0: the plane the read map select names.
+            v = pl[gc[4] & 0x03][off]
+        self.uc.mem_write(address, bytes((v,)))
 
     def _on_plane_write(self, uc, access, address, size, value, user):
         """Shadow writes to the 0xa0000 aperture into four separate planes.
