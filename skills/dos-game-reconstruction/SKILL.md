@@ -315,6 +315,39 @@ have to do this too?* If yes, it has a routine for it — find the routine. If i
 is only necessary because you are on a modern machine with a window and a
 filesystem, it is the port's, and it goes in the port's file.
 
+**Composing a screen from measured geometry loses the call graph.** It is the
+tempting shortcut and it works: fit every position and size against captures
+until the screen matches, and you get a pixel-exact reconstruction. What you do
+not get is a single entry point. The PC Lemmings port built its menu that way,
+reached 100.00%, and left **184 of 211 call targets never reached** — because
+nothing in that process ever followed the original's control flow. A
+transcription hands you its callees; a fitted spec hands you a picture.
+
+The cheap way back: **find the routine everything funnels through — a blitter,
+a text drawer, a sound call — and record the return address at its entry.** A
+`call` pushes it; a far `lcall` pushes `CS:IP`, so `[SP]` and `[SP+2]` name the
+caller. One hook, and a list of rectangles becomes a call graph. In this port
+it produced twelve call sites at once, one of them a routine that had been
+marked *"address unknown"* after both a pixel search and a geometry fit had
+failed to find it.
+
+**And a spare parameter buys a perfect score while hiding a wrong model.** That
+same port drew two animated sprites whose frame it had concluded was
+independent of the scroll — a fit over four captures had found no consistent
+relation. Reading the routine gave `frame = (scroll >> 2) & 15` in six
+instructions. The fit never had the information: a capture pins the scroll only
+modulo 16 and the relation needs it modulo 64, and *underdetermined was read as
+independent*.
+
+The tell was there to be seen and was not: the port scored **0 differing at
+every rating** with **two free parameters where the original has one**. Forced
+to one, it scored 66–120 until the missing constant turned up — the scroll
+variable's initial value, four, in the routine's own set-up.
+
+So when a screen matches perfectly, **count the parameters**. If the port has
+more knobs than the original has variables, the score is telling you about the
+knobs.
+
 **Enforce it with a check, because saying it is not enough.** The PC Lemmings
 port states this convention in its `CLAUDE.md`, in the very words above, and
 then decayed anyway: audited after a long session, **13 functions carried an
