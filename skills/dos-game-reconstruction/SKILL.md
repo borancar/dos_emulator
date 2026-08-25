@@ -492,6 +492,40 @@ a background "generated at run time", a bar of "solid fills", a font that was
 is to find what writes *into* the buffer, one step further back, and probe
 *those* sources against the data files.
 
+## When a comparison differs, emit three images and look at them
+
+A percentage says how much is wrong. It never says **what**, and a number that
+is perfectly accurate will still support a wrong conclusion. So the moment a
+comparison is not zero, write three files and open them:
+
+    <name>-original.png   what the emulator's screen actually holds
+    <name>-port.png       what the port composed
+    <name>-diff.png       the port, every differing pixel in magenta and
+                          everything that agrees dimmed to a quarter
+
+Render each side through **its own palette** rather than a shared one, so a
+palette error shows as a colour difference instead of silently cancelling.
+Crop with a row/column range and scale up; a 39-row strip at 2× is worth more
+than the whole screen at 1×.
+
+This is cheap — a PNG writer is twenty lines of `zlib` and `struct`, so it
+needs no dependency — and it repeatedly finds in one glance what a score
+cannot say at all:
+
+- A residue reported as "114 pixels, almost all at piece edges, scattered" was
+  a **single horizontal magenta line**: the top row of a preview the port drew
+  one row too high. The fix was one constant, and the difference went to zero.
+  The "scattered edges" description had been written down twice.
+- A feature was declared absent because including it made the score worse —
+  187 differing against 167. The differing pixels were in two tight clusters
+  exactly where the level's objects are; the objects were there all along and
+  the port was drawing them sixteen pixels to the right. **An aggregate score
+  is a poor way to decide whether a feature belongs on a screen.**
+
+Both of those cost a full round each, and in both the image would have shown
+it immediately. Make the three-image dump the *first* thing you do with a
+difference, not the last.
+
 ## Traps that cost real time
 
 - **A check at one value of a parameter says nothing about the parameter.**
