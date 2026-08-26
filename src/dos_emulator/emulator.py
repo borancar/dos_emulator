@@ -1461,12 +1461,23 @@ class VgaDos(DosMachine):
     # the rule (Ducks writes saves through) can say so in the same place.
     fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
 
-    def __init__(self, exe, blaster=False, vsync_hz=60.0, **kw):
+    def __init__(self, exe, blaster=False, vsync_hz=60.0, hsync_hz=None,
+                 **kw):
         # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
         # CGA, which is what Popcorn was written for and paces on. A VGA
         # refreshes its 200-line modes at 70 Hz, and a game that paces on the
         # retrace - Ducks does - runs a sixth slow at the CGA rate.
         self.vsync_hz = vsync_hz
+        # The horizontal rate for bit 0, display enable. None keeps the
+        # historical behaviour: toggle it on every read, so a guest that waits
+        # for a transition per word copied - Popcorn's snow-avoidance blit at
+        # 0x1ddf does - is never held up by a clock the emulator cannot run
+        # at. That is fine until a guest *times* this bit. PC Lemmings counts
+        # 320 of its transitions at image 0x1622 and makes the result its
+        # frame rate, and a bit that toggles per read answers with however
+        # fast the emulator happened to be running. Give a rate here and the
+        # bit comes off the wall clock instead.
+        self.hsync_hz = hsync_hz
         self.palette = [(0, 0, 0)] * 256
         self.dac_index = 0
         self.dac_phase = 0
@@ -1532,6 +1543,15 @@ class VgaDos(DosMachine):
         self.scan_queue = deque()
         self.pit_latch_toggle = {}
         self.pit_initial = 0xFFFF
+        # A counter the guest actually loaded, and when. Reading the count back
+        # is how a program measures anything - PC Lemmings loads channel 0 with
+        # 0xFFFF, waits out one vertical retrace and latches, and the
+        # difference is the frame period in PIT counts, which becomes its whole
+        # frame rate. Free-running the count off the emulator's elapsed time
+        # answers that question with an arbitrary number.
+        self.pit_load = {}
+        self.pit_load_t = {}
+        self.pit_latched = {}
         # The PC speaker, which this emulator was silent about for the whole
         # port: PIT channel 2's divisor and the gate at port 0x61 bits 0-1.
         # The game programs mode 3, writes the divisor low byte then high, and
@@ -1541,6 +1561,12 @@ class VgaDos(DosMachine):
         # 18.2 Hz a PC ticks at until something reprograms it.
         self.pit0_div = 0
         self.pit0_phase = 0
+        # The mode channel 0 was last programmed for. A guest running its
+        # timer uses mode 3, the square-wave generator; it switches to mode 0,
+        # the one-shot, precisely when it wants to *measure* something. That
+        # tells the display register which of its two jobs it is doing - see
+        # the virtual clock in _on_in.
+        self.pit0_mode = 3
         self.pit0_next = None
         self.timer_ticks = 0
         self.spk_div = 0
@@ -1548,6 +1574,17 @@ class VgaDos(DosMachine):
         self.spk_playing = None
         self.spk_chan = None
         self.t0 = time.perf_counter()
+        # Virtual time the guest has driven forward itself, added to the wall
+        # clock by _elapsed. A display register changes far faster than this
+        # emulator can be clocked - a scanline is 32 microseconds and a slice
+        # of guest instructions is a millisecond - so a guest that *times*
+        # something against the horizontal rate can never resolve it from wall
+        # time alone. Letting each read of that register advance the clock a
+        # fraction of a scanline makes the interval it measures come out at
+        # the hardware's figure, on any host, instead of measuring how fast
+        # the emulator happened to be running. Only a machine that asks for it
+        # (see hsync_hz) moves this at all.
+        self.vclock = 0.0
         self.palette_writes = 0
         self.int10_fn = Counter()
         self.text_mode = True             # DOS hands us mode 03h
@@ -1637,7 +1674,7 @@ class VgaDos(DosMachine):
 
     # ------------------------------------------------------------ timing
     def _elapsed(self):
-        return time.perf_counter() - self.t0
+        return time.perf_counter() - self.t0 + self.vclock
 
     # ------------------------------------------------------------- ports
     def _on_out(self, uc, port, size, value, user):
@@ -1692,9 +1729,13 @@ class VgaDos(DosMachine):
         elif port == 0x3D9:                   # CGA colour select
             self.cga_colour = v
         elif port == 0x43:
-            self.pit_latch_toggle[(v >> 6) & 3] = 0
-            if (v >> 6) & 3 == 0:
+            ch = (v >> 6) & 3
+            self.pit_latch_toggle[ch] = 0
+            if (v >> 4) & 3 == 0:             # counter-latch command
+                self.pit_latched[ch] = self._pit_count(ch)
+            elif ch == 0:
                 self.pit0_phase = 0
+                self.pit0_mode = (v >> 1) & 7
         elif port == 0x40:
             self.pit_initial = v | (self.pit_initial & 0xFF00)
             # Channel 0 is the timer interrupt. Its divisor arrives low byte
@@ -1706,7 +1747,16 @@ class VgaDos(DosMachine):
             else:
                 self.pit0_div = (self.pit0_div & 0x00FF) | (v << 8)
                 self.pit0_phase = 0
-                self.pit0_next = None
+                # The counter restarts from the write, so the next tick is due
+                # a period from *now*. Clearing this to None instead deferred
+                # that decision to the next poll, which is up to a whole chunk
+                # later - and a guest that reprograms the divisor inside its
+                # own handler, as PC Lemmings does on every tick, then paid a
+                # chunk per tick and ran at half the rate it asked for.
+                self.pit0_next = (self._elapsed()
+                                  + (self.pit0_div or 0x10000) / PIT_HZ)
+                self.pit_load[0] = self.pit0_div or 0x10000
+                self.pit_load_t[0] = self._elapsed()
         elif port == 0x42:                    # PIT channel 2: the speaker
             # Two writes, low byte then high, tracked by the same latch
             # toggle the reads use. speaker_on at 1ac2:0085 programs mode 3
@@ -1769,6 +1819,20 @@ class VgaDos(DosMachine):
                   f"(0x14={self.crtc.get(0x14, 0):#04x} "
                   f"0x17={self.crtc.get(0x17, 0):#04x})")
 
+    def _pit_count(self, ch):
+        """What channel `ch` would read back now.
+
+        Counts down from what the guest loaded, at the PIT's own rate, and
+        wraps - which is what mode 0 and mode 3 both do once they pass zero.
+        A channel nothing has programmed keeps the old free-running answer,
+        so a guest that only wants a value that changes still gets one.
+        """
+        el = self._elapsed()
+        load = self.pit_load.get(ch)
+        if load is None:
+            return (0x10000 - (int(PIT_HZ * el) & 0xFFFF)) & 0xFFFF
+        return (load - int(PIT_HZ * (el - self.pit_load_t[ch]))) & 0xFFFF
+
     def _on_in(self, uc, port, size, user):
         self.port_in[port] += 1
         n = self.port_in[port]
@@ -1789,15 +1853,47 @@ class VgaDos(DosMachine):
             # 60 Hz for a CGA, 70 for a VGA - see vsync_hz. The game waits
             # for this bit around every blit, so the rate it comes back at is
             # one of the two things setting the frame rate.
+            # Bit 0, display enable, has two quite different readers, and
+            # one model cannot serve both. A guest that waits on it per word
+            # copied - Popcorn's snow-avoidance blit at 0x1ddf - needs it to
+            # change every read, or the copy takes a scanline a word. A guest
+            # that *times* it needs it to change at the hardware's rate, which
+            # is 32 microseconds a line and far finer than the emulator can
+            # resolve from the wall clock.
+            #
+            # A guest says which it is doing: to time the register it needs a
+            # counter it can read back, so it puts PIT channel 0 into mode 0,
+            # the one-shot, first. While that is true, each read moves the
+            # clock on an eighth of a scanline - fine enough that every
+            # half-period the guest polls for is sampled, so a loop counting
+            # transitions counts one per line and no more, and the interval it
+            # measures comes out at the hardware's figure on any host. The
+            # rest of the time the bit just toggles and costs nothing.
+            timing = self.hsync_hz is not None and self.pit0_mode == 0
+            if timing:
+                self.vclock += 0.125 / self.hsync_hz
+                el = self._elapsed()
             vsync = 0x08 if (el * self.vsync_hz) % 1.0 > 0.92 else 0x00
-            return vsync | (0x01 if (n & 1) else 0x00)
+            if timing:
+                de = 0x01 if (el * self.hsync_hz) % 1.0 > 0.5 else 0x00
+            else:
+                de = 0x01 if (n & 1) else 0x00
+            return vsync | de
         if port in (0x40, 0x41, 0x42):
             ch = port - 0x40
-            counter = int(PIT_HZ * el) & 0xFFFF
-            counter = (0x10000 - counter) & 0xFFFF
+            # A latched count is frozen: both bytes must come from the one
+            # instant the latch command named. Computing it afresh per byte
+            # takes the low byte of one moment and the high byte of another,
+            # and the 16-bit value assembled from them is not a time at all.
+            counter = self.pit_latched.get(ch)
+            if counter is None:
+                counter = self._pit_count(ch)
             t = self.pit_latch_toggle.get(ch, 0)
             self.pit_latch_toggle[ch] = 1 - t
-            return counter & 0xFF if t == 0 else (counter >> 8) & 0xFF
+            if t == 0:
+                return counter & 0xFF
+            self.pit_latched.pop(ch, None)
+            return (counter >> 8) & 0xFF
         if port == 0x60:
             return self.last_scancode
         if port == 0x61:
@@ -2274,6 +2370,32 @@ class VgaDos(DosMachine):
         bx = self._reg(UC_X86_REG_BX)
         page = (bx >> 8) & 7
         self.int10_fn[ah] += 1
+
+        # AH=1Ah: read display combination code. A VGA BIOS answers with
+        # AL=1Ah, and a program tests that byte to find out whether it is
+        # talking to a VGA at all - PC Lemmings does, at image 0x1410, and
+        # when the call goes unanswered it decides it is on something older
+        # and times its frame rate against 160 scanlines instead of the 320
+        # a VGA's line-doubled 200-line mode actually has, ending up twice
+        # too fast. BL=8 is "VGA with an analog colour display", BH=0 for no
+        # second adapter.
+        if ah == 0x1A and al == 0x00:
+            self._set(UC_X86_REG_AX, (ax & 0xFF00) | 0x1A)
+            self._set(UC_X86_REG_BX, 0x0008)
+            return
+
+        # AH=12h BL=10h: return EGA configuration. A VGA BIOS answers this
+        # too, and leaving it unanswered is not neutral - BL comes back
+        # unchanged, the caller reads that as "no EGA here", and PC Lemmings
+        # then decides it is on a CGA. That costs it a factor of two, because
+        # it times its frame rate against 160 scanlines on a CGA and 320 on
+        # anything that doubles a 200-line mode. BH=0 colour, BL=3 for 256K,
+        # CH=0 feature bits, CL=9 the switch setting for a high-resolution
+        # colour display.
+        if ah == 0x12 and (bx & 0xFF) == 0x10:
+            self._set(UC_X86_REG_BX, 0x0003)
+            self._set(UC_X86_REG_CX, 0x0009)
+            return
 
         # AH=0Ch/0Dh: one pixel. Popcorn's menu draws its bouncing kernels
         # this way, a BIOS call per pixel - which is where the six hundred
@@ -2922,6 +3044,13 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
     ap.add_argument("--blaster", action="store_true")
     ap.add_argument("--chunk", type=int, default=20_000,
                     help="instructions to run between display updates")
+    ap.add_argument("--timer-slices", type=int, default=1,
+                    help="how many times to service the timer within one "
+                         "chunk (default 1). The tick rate cannot exceed the "
+                         "rate the timer is looked at, so a guest that "
+                         "programs the PIT faster than chunk/ips silently "
+                         "runs slow; raise this until the delivered rate "
+                         "matches the divisor the guest wrote")
     ap.add_argument("--ips", type=int, default=IPS_8086_8MHZ,
                     help="pace the guest to this many instructions per second "
                          "(default: an 8 MHz 8086, the machine the game's "
@@ -3129,7 +3258,8 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             # guest's standards - real hardware interrupts within microseconds
             # of a block completing - and anything that waits on an interrupt
             # with a retry counter rather than a clock gives up long before it.
-            slices = max(1, args.sound_slices if m.sb is not None else 1)
+            slices = max(1, args.sound_slices if m.sb is not None else 1,
+                         args.timer_slices)
             step = max(1000, args.chunk // slices)
             for _ in range(slices):
                 try:
