@@ -1567,6 +1567,12 @@ class VgaDos(DosMachine):
         # tells the display register which of its two jobs it is doing - see
         # the virtual clock in _on_in.
         self.pit0_mode = 3
+        # Consecutive reads of the display status register with nothing else
+        # happening in between. A guest spinning on the retrace bit is doing
+        # nothing a host has to reproduce - the time passes whether or not the
+        # spin is executed - so once the streak makes the intent plain the
+        # clock can be moved to the edge being waited for. See _on_in.
+        self.da_streak = 0
         self.pit0_next = None
         self.timer_ticks = 0
         self.spk_div = 0
@@ -1674,10 +1680,27 @@ class VgaDos(DosMachine):
 
     # ------------------------------------------------------------ timing
     def _elapsed(self):
+        """Time as the *guest* experiences it: wall clock plus what it has
+        waited out. Everything the guest can observe - the PIT, the retrace
+        bit, when the timer is due - must come from here, or the parts of its
+        own clock it measures will not agree with each other."""
         return time.perf_counter() - self.t0 + self.vclock
+
+    def _wall(self):
+        """Real time since the machine started.
+
+        The harness's own scheduling - how long to run for, when to take a
+        screenshot, when a driver script fires - belongs on this and not on
+        _elapsed. A guest that waits out a lot of retraces runs the virtual
+        clock far ahead of the real one, and a run told to last sixty seconds
+        would then stop after twenty."""
+        return time.perf_counter() - self.t0
 
     # ------------------------------------------------------------- ports
     def _on_out(self, uc, port, size, value, user):
+        # Any port write means the guest is doing something, so it is not
+        # sitting in a retrace spin - see da_streak in _on_in.
+        self.da_streak = 0
         self.port_out[port] += 1
         v = value & 0xFF
         # Sound card and its DMA channel take priority over the VGA decoding
@@ -1837,6 +1860,8 @@ class VgaDos(DosMachine):
         self.port_in[port] += 1
         n = self.port_in[port]
         el = self._elapsed()
+        if port != 0x3DA:
+            self.da_streak = 0
         if port == 0x3DA:
             # A read here resets the attribute controller's index/data
             # flip-flop. Programs rely on that to resynchronise before
@@ -1870,6 +1895,21 @@ class VgaDos(DosMachine):
             # measures comes out at the hardware's figure on any host. The
             # rest of the time the bit just toggles and costs nothing.
             timing = self.hsync_hz is not None and self.pit0_mode == 0
+            self.da_streak += 1
+            if (self.hsync_hz is not None and not timing
+                    and self.da_streak > 64):
+                # A long unbroken run of reads here and nothing else: the
+                # guest is waiting for the retrace bit to change and will do
+                # nothing until it does. Skip to the change. It costs the
+                # guest exactly the time it would have spent spinning, and
+                # saves executing the spin - which in PC Lemmings' IRQ 0
+                # handler at image 0x17FE was 919 passes an entry and 29% of
+                # every instruction the game ran.
+                phase = (self._elapsed() * self.vsync_hz) % 1.0
+                nxt = 0.92 if phase < 0.92 else 1.0
+                self.vclock += (nxt - phase) / self.vsync_hz
+                self.da_streak = 0
+                el = self._elapsed()
             if timing:
                 self.vclock += 0.125 / self.hsync_hz
                 el = self._elapsed()
@@ -3008,7 +3048,7 @@ def capture(m, screen, tag, outdir="debug"):
     state = m.vga_state()
     state["cs:ip"] = (f"{m._reg(UC_X86_REG_CS):04x}:"
                       f"{m._reg(UC_X86_REG_IP):04x}")
-    state["elapsed"] = round(m._elapsed(), 2)
+    state["elapsed"] = round(m._wall(), 2)
     state["files_read"] = m.files_read
     with open(f"{base}_state.json", "w") as f:
         json.dump(state, f, indent=2)
@@ -3313,10 +3353,10 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             if frames >= h[2]:
                 m.press_key(h[0], h[1], down=False)
                 held.remove(h)
-        while script and script[-1][0] <= m._elapsed():
+        while script and script[-1][0] <= m._wall():
             when, key, release = script.pop()
             send(key, release, f"t={when:.1f}s")
-        if args.run_seconds and m._elapsed() >= args.run_seconds:
+        if args.run_seconds and m._wall() >= args.run_seconds:
             print(f"  [ctl] --run-seconds {args.run_seconds} reached")
             running = False
 
@@ -3435,7 +3475,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
         pygame.display.flip()
         frames += 1
 
-        el = m._elapsed()
+        el = m._wall()
         if True:
             if el >= next_status:
                 fb = m.framebuffer()
@@ -3481,7 +3521,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
     if control is not None:
         control.close()
     print(f"\n=== finished after {frames} display updates, "
-          f"{m._elapsed():.1f}s ===")
+          f"{m._wall():.1f}s ===")
     print(f"  video modes set : {[hex(v) for v in m.video_modes]}")
     if m.hooked_vectors:
         print(f"  vectors hooked  : "
