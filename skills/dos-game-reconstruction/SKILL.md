@@ -655,9 +655,9 @@ typedef struct __attribute__((packed)) {
 
 /* _Static_assert is C11; in C99 the negative-array-size trick names the
  * field in the error message, which is what you want at 3am. */
-#define IMG_AT(field, off) \
-    typedef char img_at_##field[offsetof(game_vars, field) == (off) ? 1 : -1]
-IMG_AT(frame_delay, 0x1487);
+#define ENSURE_IMG_AT(field, off) \
+    typedef char ensure_img_at_##field[offsetof(game_vars, field) == (off) ? 1 : -1]
+ENSURE_IMG_AT(frame_delay, 0x1487);
 ```
 
 Now every address in the disassembly is machine-checked. Get one padding length
@@ -675,6 +675,16 @@ Practical rules, each of which was learned the hard way:
 - **Records get their own types**, with the size asserted too — the entity
   node, the ball, the level, the per-player save. `sizeof(ball_t) == 0x1e`
   catches what field offsets alone cannot.
+- **Name the checks so a failure names itself.** `ENSURE_IMG_AT`,
+  `ENSURE_BALL_AT`, `ENSURE_SIZE`, and generate the typedef with the same
+  prefix — the error you read at 3am should say which check caught it.
+- **The packing is load-bearing.** The struct must land on the program's own
+  addresses, and in a 16-bit binary most words sit at odd offsets. There is no
+  "unpacked, naturally aligned" variant that is still the image, and no
+  build-time choice between them: drop the attribute and the fields move, which
+  the asserts refuse to compile. Worth knowing before someone proposes it as an
+  optimisation — and on x86 it buys nothing anyway, since unaligned access is
+  native.
 - **Some offsets must stay offsets.** Where the original passed an image
   address in a register, or *stored* one in a structure, the value is an
   address and has to remain one. Bridge with a helper — `img_off(&gv.balls[i])`
