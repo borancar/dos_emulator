@@ -3360,6 +3360,19 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             print(f"  [ctl] --run-seconds {args.run_seconds} reached")
             running = False
 
+        # A HOOK CAN ASK THE RUN TO END. `uc.emu_stop()` from inside a hook
+        # only ends the current `emu_start`, and this loop calls it again on
+        # the next pass - so a capture that has everything it wants had no way
+        # to stop, and paid out the whole of its --run-seconds. A recorder
+        # asking for four frames sat here for five minutes.
+        #
+        # Additive and default-preserving: nothing sets this attribute unless
+        # it means to, and `getattr` keeps machines that have never heard of
+        # it behaving exactly as before.
+        if getattr(m, "stop_requested", False):
+            print("  [ctl] a hook asked the run to stop")
+            running = False
+
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False

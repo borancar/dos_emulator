@@ -69,7 +69,109 @@ more than one that claims 100%.
 Everything else — a routine that is tedious, a routine that is long, a routine
 whose purpose is unclear until it is read — is the work, not a blocker.
 
-## The order of work
+## Transcribe. Do not implement.
+
+**This is the single rule the rest of the method exists to serve, and breaking
+it is what has cost the most time on every port so far.** The failure is never
+that the code does not work. It is that it works, looks reasonable, passes
+every comparison anyone thought to run, and is *not what the program does* -
+and the difference surfaces months later as a player-visible bug nobody can
+trace.
+
+The temptation has a specific shape. You know how DOS games of the era work.
+You know there is a BIOS key buffer at 0040:001E, that INT 33h reports mouse
+buttons in BX, that a screen loop polls and returns what was chosen. That
+knowledge is *usually right about the era and wrong about this program*, and it
+produces code confident enough that nobody goes and reads the routine.
+
+Three from one session, all in one subsystem:
+
+- **A key queue.** The port drained host events into a ring, with a careful
+  paragraph explaining that the original "polls a BIOS buffer once a pass, so a
+  press between two polls is held rather than lost". The original does not
+  touch the BIOS buffer. Its INT 9 handler keeps an 83-byte table, one entry
+  per scancode, and the poll SCANS that table - with an auto-repeat countdown
+  in the low seven bits of each entry, firing on the first look and then not
+  again for twenty polls. The invented ring repeated at the host's rate instead
+  of the game's. The comment was honest, detailed, and describing a program
+  that does not exist.
+
+- **Four readers of one byte.** Each screen got the button handling it needed,
+  written where it was needed: one with its own latched state, one with its own
+  pump, one taking a callback, one reading the shared byte. The original has
+  ONE byte, `ds:0x14`, and every screen polls it. The four independent event
+  pumps meant three of them swallowed key releases without telling the
+  keyboard handler - so a held-key bit stayed set for ever, and Escape ending a
+  level left Escape pressed into the next one, which ended instantly. A player
+  found it. No comparison here could: they all compare pictures.
+
+- **A shape the original does not have.** `menu_show_until_dismissed(screen)
+  -> what was chosen` is a perfectly sensible function and the original has
+  nothing like it. What it has is a routine that fades a palette up, polls two
+  words, fades down, and JUMPS to whichever screen the answer names. Written as
+  a returning function with a callback and a click id, the caller could not
+  tell Escape from a click and every briefing played the level.
+
+And from earlier ports: a sprite index computed as `base + n * step` because
+that is how tables work (the store is backwards, and only one of the four
+values was reachable, so the check passed); a compositing rule fitted from four
+plausible candidates, narrowed convincingly, and not in the family the real
+rule belonged to.
+
+**The rule:**
+
+> If the original has a routine for it, go and read that routine. Do not write
+> what you believe it does, however confident the belief and however well the
+> result matches.
+
+**The one exception is IO, and it is narrow.** The card, the PIT, the DAC, the
+disk, the mouse driver, the key matrix - those have no counterpart on a modern
+machine and must be replaced rather than transcribed. Everything else is
+transcription, including things that *feel* like IO:
+
+- a palette is not the card. The original keeps its slots in its own data
+  segment and pushes one at the DAC; only the push is the hardware's.
+- a keyboard handler is not the hardware. What port 0x60 produced is; the
+  table the ISR builds out of it, and everything that reads that table, is the
+  game.
+- a loop that waits for a button is not the window. The wait is the game's; the
+  event queue behind the button is the host's.
+
+The test is mechanical: **the file that talks to the host must contain no
+routine the binary has an address for.** Grep it for the platform's API after
+moving anything, and grep the game file for the platform's API too - it must
+have none. When something has a sequence in it, it belongs with the game
+however much hardware it touches; split the hardware's share out as a primitive
+the transcription calls, and name in that primitive's comment the address of
+the thing it stands in for.
+
+**How the drift actually happens**, because it is never a decision:
+
+1. A routine is needed and reading it would take an hour.
+2. Something plausible is written, and it works.
+3. A comment is added explaining the reasoning - which makes it look *more*
+   researched, not less.
+4. Nobody reads the original, because the comment says what it does.
+
+Step 3 is the dangerous one. A confidently-worded comment on invented code is
+worse than no comment, because it stops the next reader going to look.
+`sub_1558` with no explanation gets read; "the original polls a BIOS buffer" does
+not.
+
+**When you catch yourself implementing**, the tells are:
+
+- the comment explains a MECHANISM rather than citing an address
+- it says "the original probably", "this is how DOS games", "so that a press is
+  not lost"
+- the function's shape is a convenience the caller wanted
+- you are reasoning about what would be sensible rather than about what is at
+  an offset
+
+Any of those means stop and read the routine. It is nearly always faster than
+the rounds of measurement that follow a wrong implementation - and there is
+usually no measurement that would have caught it at all.
+
+## The order of work## The order of work
 
 **1. Find out what is already known, before starting.**
 DOS-era games often have a modding community that documented the file formats
