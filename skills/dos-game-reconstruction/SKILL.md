@@ -145,6 +145,46 @@ however much hardware it touches; split the hardware's share out as a primitive
 the transcription calls, and name in that primitive's comment the address of
 the thing it stands in for.
 
+**Transcribe the VISIBLE behaviour, not the hardware mechanism.** This is
+where the rule stops, and it stops earlier than "transcribe everything"
+suggests. What you owe is the pixels, the samples and the state the program
+produces - not the sequence of port writes it produced them with.
+
+A blit is the clearest case. The original programs a map mask, a bit mask, a
+set/reset value and a write function, then stores one byte and lets the card
+spread it across four planes through the latches. A port has no card. Writing
+an emulated Graphics Controller so the same `stosb` can go through it would be
+modelling the MECHANISM, and it buys nothing: the observable result is which
+pixels changed and to what. Work out what the registers MEAN - "this pass
+writes plane 2 wherever the mask bit is set, OR-ed with what is there" - and
+write that.
+
+The same applies to any hardware idiom used for speed. If the latches are set
+up to copy one byte to four planes at once, as Wolfenstein's do, the
+transcription is four copies - not a latch model that makes one copy look like
+four. If a routine unrolls a loop sixteen times because the 286 had no cache,
+write the loop. If it self-modifies an immediate to avoid a branch, write the
+branch.
+
+**But the mechanism still decides where the boundary falls, so read it before
+you decide it does not matter.** Two things routinely hide inside "just how the
+card works" and are not:
+
+- **How many passes there are, and in what order.** A four-pass plane loop that
+  re-reads the destination each pass is not the same as one pass that computes
+  everything at once - it is only the same when the passes happen not to
+  interact, and knowing that requires reading them. Getting this wrong produces
+  code that is right on the data you tested and wrong on data you did not.
+- **What a register is computed FROM.** A bit mask derived from a read of the
+  destination is a data dependency, not a configuration step. Flatten it into a
+  constant and the routine still works on most inputs.
+
+So: model the mechanism when it changes what is produced, and skip it when it
+only changes how. The test is whether you can state the rule in terms of
+inputs and outputs - "this pixel becomes that value" - without naming a
+register. If you can, write that. If you cannot yet, you have not finished
+reading.
+
 **How the drift actually happens**, because it is never a decision:
 
 1. A routine is needed and reading it would take an hour.
