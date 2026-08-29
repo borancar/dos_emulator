@@ -634,6 +634,78 @@ that is the whole of its job. If SDL is scaling, filtering or blending
 something the original decided for itself, the port has quietly stopped being
 the reconstruction.
 
+**Lay a packed struct over the image; do not write `#define` per address.**
+The obvious way to reach the program's variables is a define per address and
+`g_image[FOO]` at each use. It works and it is a trap, for two reasons the
+compiler cannot see: the *width* of a field is chosen afresh at every call site,
+so a byte read as a word is a bug nothing catches, and a wrong address is
+simply a wrong address.
+
+Instead declare the load image as one packed struct with explicit padding, and
+**assert every field's offset at compile time**:
+
+```c
+typedef struct __attribute__((packed)) {
+    uint8_t  _pad_00[5253];
+    uint8_t  speed_step;                /* 0x1485 */
+    uint16_t frame_delay;               /* 0x1487 */
+} game_vars;
+
+#define gv (*(game_vars *)g_image)      /* the same bytes as g_image */
+
+/* _Static_assert is C11; in C99 the negative-array-size trick names the
+ * field in the error message, which is what you want at 3am. */
+#define IMG_AT(field, off) \
+    typedef char img_at_##field[offsetof(game_vars, field) == (off) ? 1 : -1]
+IMG_AT(frame_delay, 0x1487);
+```
+
+Now every address in the disassembly is machine-checked. Get one padding length
+wrong and every field after it shifts, the build fails, and it names the first
+one that moved.
+
+Practical rules, each of which was learned the hard way:
+
+- **Generate the struct from a table; never hand-write padding.** Keep
+  `(offset, name, type, size, comment)` somewhere and emit the struct and its
+  asserts. The generator should **refuse overlaps** — that check is worth more
+  than the convenience.
+- **Offsets in hex, padding lengths in decimal.** An offset is an address; a
+  padding entry is a count of bytes, and hex invites reading it as an address.
+- **Records get their own types**, with the size asserted too — the entity
+  node, the ball, the level, the per-player save. `sizeof(ball_t) == 0x1e`
+  catches what field offsets alone cannot.
+- **Some offsets must stay offsets.** Where the original passed an image
+  address in a register, or *stored* one in a structure, the value is an
+  address and has to remain one. Bridge with a helper — `img_off(&gv.balls[i])`
+  and `ball_at(off)` — rather than changing every signature.
+- **It assumes little-endian**, where a hand-written `lo | hi << 8` accessor did
+  not. For a DOS binary that is a fair trade; write it down rather than let it
+  be discovered.
+- **Convert in themed batches and verify each** against the original. Choose
+  the route that exercises *that* batch: the keyboard route for the input
+  fields, the menu route for the banner.
+
+What this finds, which is the real argument for it. On one 8,000-line
+transcription it turned up: four variables named after the wrong feature
+entirely (a laser's, when the writes came from the safety net); three bytes
+carrying two names each, defined in two different files; a pool declared as
+four records when only three fit before the next variable, with the wrong
+count duplicated in a second file under different member names; and a field
+that looked six bytes long whose seventh and eighth were a different variable
+altogether. None of these were behaving incorrectly. All of them were lies in
+the notes, and the padding arithmetic is what refused them.
+
+Two things it will not catch, so check them by hand:
+
+- **The trailing length of the last field before padding.** Offsets are pinned
+  on one side only. If a table is really three entries and you declare four,
+  nothing objects unless it collides with what follows.
+- **An array in a boolean context.** Converting `img_w(TABLE)` to `gv.table`
+  where the field is an array gives a pointer, which is *always true* — the
+  exact inversion of a test that was always false. It compiles silently. It
+  wants `gv.table[0]`.
+
 **7. Verify differentially, per routine.**
 Stop the emulator at a routine's entry, capture the machine, let the
 **original** body run to its return, capture again. Run the C on the first
