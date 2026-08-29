@@ -230,6 +230,34 @@ Finding the boundaries:
 - With **hand-written assembly**, the same reasoning applies to the author's
   `.ASM` files. If it was one file, the port is one file.
 
+**The files the ORIGINAL does not have need naming too, and there are exactly
+two.** Mirroring translation units tells you where transcribed code goes; it
+says nothing about the rest, and the rest will otherwise settle wherever it
+was first written. Give it two homes and hold the line:
+
+- an **IO file** for what the hardware used to do — the DAC's widening, the
+  planar-to-chunky assembly, the window, the event queues, the frees DOS did.
+- a **harness file** for what neither the game nor the hardware does: a
+  recorded input script, a flat view of a struct for a Python tool, a frame
+  sink, a viewer that exists so a person can look at a screen.
+
+Then every function answers "where did this come from" with one of three
+things: an image address, "what the card did", or "nothing in the original —
+it is here to check the game". A routine with an address goes in the game file
+**even when it ends in a window**; split the hardware's share out as a
+primitive the transcription calls, and check the split was honest rather than
+a relocation by grepping the game file for your graphics library's prefix. It
+should find nothing.
+
+**Link the harness file into the CORE, not into the harness binary.** This is
+the counter-intuitive part and it is where the reasoning usually goes wrong:
+the unit tests and the ctypes shared library link the game and IO objects and
+**not** the harness binary's `main`, so anything a test or a tool calls has to
+be in the core. "Move the harness code to the harness binary" breaks both. The
+harness binary is the harness's COMMAND LINE; the harness file is its
+machinery. Before moving anything on the grounds that it is harness code,
+check which binaries link it — the link sets decide, not the name.
+
 Two things a port legitimately adds, and both must say so in the file header:
 
 - **An I/O boundary chosen for porting.** Splitting the hardware and DOS
@@ -439,6 +467,23 @@ Two practical corollaries:
   arguments should open the game, not write a bitmap. A reconstruction whose
   default output is a file is a converter; the burden of proof is to be the
   game.
+- **Grab the mouse, and always give it a release.** A DOS game that uses the
+  mouse owns it completely: it hides the driver's pointer, sets its own range
+  in its own coordinates, and draws its own cursor. A window that lets the
+  host pointer wander out of it while the game still thinks the pointer is
+  moving does not reproduce that — the game's cursor stops at the edge of your
+  desktop instead of at the edge of the game's range, and the two disagree
+  about where the pointer is.
+
+  So capture it: SDL3's relative mouse mode, tracking `xrel`/`yrel` rather
+  than an absolute position — which is also what the original works in, since
+  it asks the driver for *mickeys* and sets the mickey-to-pixel ratio itself.
+
+  **A grab without a release is a bug, not a feature.** Bind Ctrl+Alt to hand
+  the pointer back — the gesture DOSBox trained everyone to reach for — and
+  take it again on a click in the window. Release it on the way out, too: a
+  window that exits still holding the pointer leaves the user with no mouse
+  and no obvious reason why.
 
 Do not reach for SDL's higher-level conveniences to stand in for something the
 original did itself. The composed frame is the port's own 8-bit indexed buffer,
@@ -478,9 +523,10 @@ months on screens no run can see.
 
 ## Coverage is where self-deception lives
 
-Track two different numbers and never conflate them:
+Track three different numbers and never conflate them:
 
-- **transcribed** — the routine exists in C
+- **cited** — a function in the port carries that routine's address
+- **transcribed** — the whole routine came across, not just its first half
 - **verified** — the original has actually been run against it
 
 A routine transcribed and never wired into the checker looks finished in the
@@ -490,6 +536,70 @@ from *agreed but every call was an early return* — the second is not evidence.
 And note that a routine whose **caller** is being sampled is never sampled
 itself, so a naive pass reports as unchecked a great many routines it ran
 straight past. Chase callers explicitly.
+
+### A cited address is not a transcribed routine
+
+The gap between the first two is where whole features go missing, and the
+usual provenance check cannot see it. A function that carries an address and
+implements the first half of the routine passes exactly as one that implements
+all of it.
+
+In the Lemmings port this shipped a feature that did nothing: a six-line
+function carried the address of a 156-byte level-code entry loop — ten cells,
+a key read, backspace, Enter, a return — and the screen it belonged to
+transcribed only the set-up half of *its* routine. Both passed the check. A
+player reported that typing a code changed nothing on screen.
+
+So **measure depth as well as presence**: for each call target, weigh the span
+up to the next one against the size of the function claiming it. A dozen bytes
+of original per line of C is the smell. Two cautions:
+
+- It is a smell, not a verdict. A transcribed table is three lines for eighty
+  bytes and complete, and a routine split across several port functions needs
+  a total rather than the largest claimant.
+- **Do not measure citation density.** Counting how many addresses inside a
+  routine the port mentions scores *comments*, not code — the failing case
+  above cited five addresses while implementing one of them. Check any new
+  coverage tool against the commit where the bug was live; if it does not
+  flag it there, it does not work.
+
+**Write this into the project's `CLAUDE.md`**, with its own tool named, the
+way the other conventions go in. It is the one that decays invisibly: each
+omission is a routine someone meant to come back to, and nothing in the build
+ever mentions it again.
+
+## A transcribed loop has no way out, and that is the transcription being right
+
+The original owns the machine. Its screens end when the game says so, there is
+no window to close and no shell to interrupt, so its loops leave on the keys
+the game gives them and on nothing else. Transcribe one faithfully and the
+port has no escape at all.
+
+In the Lemmings port a level-code screen was transcribed from a loop that
+leaves on Enter and nothing else. SDL delivers Ctrl+C as a quit *event*, the
+loop dropped it along with every other key outside A-Z, and the process could
+only be killed. A player reported it as a lock-up.
+
+**Put the way out in the IO layer, once.** A "has it closed" flag threaded
+through every transcribed loop puts a host concern inside routines that are
+meant to read as the game, and has to be remembered at every new loop — which
+is exactly how it gets missed. One function that ends the process, called from
+every quit-event site and from a `SIGINT`/`SIGTERM` handler, and no
+transcribed loop needs to know it can happen.
+
+**It must `_exit`, not `exit`.** Calling the toolkit's shutdown and then
+`exit` runs whatever teardown is registered with `atexit` over the same
+handles — closing the window segfaulted, while Ctrl+C did not, because the
+signal path was already `_exit`. Two ways out of a program are two teardowns
+that will differ. The window manager reclaims a window from a process that is
+gone.
+
+**And a page flip has to be told which buffer is up.** The original points the
+display at whatever it just composed and cannot get this wrong; a port holding
+a pointer can, silently — the same screen reported "nothing changes when I
+type", because the flip still aimed at the previous screen's buffer. Set it
+from every screen that runs its own loop, and clear it when that buffer is
+freed.
 
 ## Reaching the state is the actual skill
 
@@ -848,9 +958,19 @@ minimum:
 - **SDL3 for the window, input and sound — never a platform-specific library**,
   and never as an optional path beside a file writer. The port shows a screen
   by default.
+- **one way out, in the IO layer** — closing the window and Ctrl+C both end the
+  process immediately, through a single function called from every quit-event
+  site and from a signal handler, using `_exit` so a registered teardown does
+  not run twice. Transcribed loops leave on the keys the game gives them and
+  must not be taught about windows
 - addresses are image offsets unless written `seg:off`, and every transcribed
   routine **and every transcribed table** carries the one it came from, as a
   comment on the thing itself
+- **a cited address is not a transcribed routine** — carrying an address says
+  where a function came from and nothing about how much of it came across, and
+  a half-transcribed routine passes the provenance check exactly as a whole
+  one does. Name the tool that measures depth beside the one that measures
+  presence, and say what shipped broken because nothing did
 - the port's `.c` files mirror the **original's translation units**, functions
   in address order; any boundary you added for porting says so in its header
 - where a name or a type is a guess, say so
