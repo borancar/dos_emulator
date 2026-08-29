@@ -814,6 +814,41 @@ ones differ.
 
 ## Traps that cost real time
 
+- **Read the build's warnings; grep for `warning:`, not just `error`.** Three
+  player-visible bugs in one afternoon came out of a single mechanical rename
+  that turned locals into globals of the same name — one producing
+  `g_tex = g_tex;`, which left the game drawing nothing, and one a shadowed
+  `int grabbed = 1;`, which ate the first mouse click of every level. The
+  compiler named both, on the exact line, with `-Wshadow`. The build output was
+  being grepped for `error`. **Keep the build at zero warnings** so a new one
+  is visible at all, and turn on `-Wshadow` and `-Wunused` before you start:
+  a rename is the commonest large edit in this work and shadowing is its
+  commonest failure.
+
+- **A transcription tells you what a routine DOES, never that it RUNS.** A
+  dispatch on a keyboard byte was read correctly, transcribed correctly, given
+  unit tests that drove it directly and passed — and the keys did nothing in
+  the real game, because the frame loop cleared that byte three instructions
+  before the only caller read it. A sibling routine reading the SAME byte
+  worked, because it is called from inside the keyboard interrupt, a few
+  instructions after the store.
+
+  So before wiring a transcribed routine to anything a player can press,
+  **find its caller and ask what the state looks like at that moment**. A test
+  that calls your function proves the arithmetic and is silent about
+  reachability. Dead code in the original is worth transcribing and worth
+  leaving unwired, with the evidence in the comment — the next reader will
+  find the same instructions and have the same idea.
+
+- **Searching for the opcodes you thought of finds the opcodes you thought
+  of.** Asked whether anything ever wrote that byte, I scanned for three store
+  forms, found only stores of zero, and concluded it was never set. The form I
+  had not thought of — `mov [mem], ah` — is the one that sets it. The
+  conclusion happened to be right and the reason was wrong, which is worse
+  than being wrong outright, because it gets written down as settled.
+  **Search for the ADDRESS and decode what surrounds each hit**; that finds
+  every form, including the ones through a register or a segment override.
+
 - **A check at one value of a parameter says nothing about the parameter.**
   PC Lemmings' menu draws the difficulty name from
   `RATING_BASE + rating * RATING_STEP`. The four sprites are stored
@@ -921,6 +956,28 @@ ones differ.
   until the picture is actually bright, and keep the **brightest** sample
   rather than the last, because a fade at the end of a level will otherwise
   hand you black just as the timeout expires.
+- **A byte-identical output can be a dead window.** After a refactor that
+  moved the display loop, the check used to justify it was a frame sink: the
+  port writes each composed frame to a file, and the files were byte-identical
+  to the previous build's. They were, and the game drew nothing — the sink
+  writes the composed BUFFER and never touches the texture the window shows.
+  Composition and presentation are two stages, and a harness that captures the
+  first cannot see the second fail.
+
+  When a change touches the display path the check has to end **at the
+  screen**: run the real binary and look. And make the silent path loud — the
+  upload returned early on a null handle and said nothing, which is why a
+  completely dead window looked exactly like a quiet frame.
+
+- **A planted fault that was never planted proves nothing.** The usual control
+  here is "break it and check the test fails". Twice that control lied: once a
+  `sed` did not match because of trailing whitespace, so the build was
+  unchanged and the test passing read as a test too weak to catch the bug;
+  once a `git stash` reverted the fix AND the new warning together, so nothing
+  could have fired and silence read as "the bug was not real". **Assert that
+  the edit landed** — a replacement count, a grep for the new text — before
+  believing what the rebuilt binary says.
+
 - **Check the baseline before diagnosing a failure.** If a comparison fails
   after a change, rebuild at the previous commit and run the *same* check. Half
   the time the divergence was already there and belongs to someone else.
