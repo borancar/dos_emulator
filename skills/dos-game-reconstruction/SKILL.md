@@ -687,13 +687,18 @@ Practical rules, each of which was learned the hard way:
   native.
 
   The packing is a symptom, not the problem: it is forced by the image being
-  the authoritative store. It would only go by moving the mutable state into
-  ordinary C structures and keeping the image as the read-only reference data
-  it mostly is — which means finding every image offset the original *stores*
-  in its own data, and giving up a verifier that compares whole images. That is
-  work for after everything is proven, and it trades away the property that the
-  C can be read against the disassembly. Worth recording as a stretch goal;
-  not worth doing early.
+  the authoritative store. Having both layouts from one definition — `#ifdef`
+  around the padding and the attribute — is easy; *earning the right to compile
+  the unpacked one* is the work, and it divides in two. Most struct-to-offset
+  bridges turn out to be self-inflicted: a routine takes an offset because the
+  verifier dispatches it by address with the original's register arguments, so
+  `draw(img_off(b->sprite))` only wants to be `draw(b->sprite)`. What is real is
+  where the original **stores** an image address inside its own data — a linked
+  list's next pointer, an address parked in a record and compared against
+  another. Those are the game's own 16-bit values, and until they have a
+  representation that is not an offset, the unpacked struct cannot be the
+  state. Count both before estimating: the first kind is mechanical, the second
+  is design.
 - **Some offsets must stay offsets.** Where the original passed an image
   address in a register, or *stored* one in a structure, the value is an
   address and has to remain one. Bridge with a helper — `img_off(&gv.balls[i])`
