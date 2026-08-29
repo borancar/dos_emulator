@@ -814,6 +814,35 @@ ones differ.
 
 ## Traps that cost real time
 
+- **Sound came from an interrupt, so it must not come from the game loop.**
+  A game of this era ticks its music driver from the timer ISR - the PIT calls
+  it fifty to a hundred times a second whatever the program is doing - and the
+  sound chip plays continuously in hardware. The main loop touches audio
+  nowhere.
+
+  Port that as a queue the game tops up once a frame and you inherit three
+  faults that look unrelated and are one: **latency**, because an effect is
+  rendered behind whatever is already queued; **freezing**, because any screen
+  whose loop forgets to pump stops the sound, and the next screen that
+  remembers resumes it mid-decay; and **a residue** that outlives the driver's
+  own stop and has to be cleared by hand. Each was reported separately by a
+  player, and each got a local fix before the shape was visible.
+
+  **The audio device's own callback is the ISR's counterpart.** Modern audio
+  APIs will call you from their thread when the hardware wants more, which is
+  exactly the relationship the chip had with the timer: the driver then runs
+  on the DEVICE's clock, the queue is one device period rather than a tuned
+  number of milliseconds, and no screen can forget to feed it. Generate the
+  samples by advancing the transcribed ISR at the rate the requested sample
+  count implies. Take the stream's lock around anything the game writes into
+  driver state - that lock is the `cli` the original got for free by sharing
+  one processor with its interrupt.
+
+  And when the push model goes, **its checks have to go with it**: a target
+  depth, a "does the pump keep up" probe, tests that model a queue nothing
+  fills any more. A check that models a mechanism the code no longer has is
+  worse than no check, because it keeps agreeing.
+
 - **Read the build's warnings; grep for `warning:`, not just `error`.** Three
   player-visible bugs in one afternoon came out of a single mechanical rename
   that turned locals into globals of the same name — one producing
