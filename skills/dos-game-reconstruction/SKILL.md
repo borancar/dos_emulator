@@ -685,6 +685,15 @@ Practical rules, each of which was learned the hard way:
   the asserts refuse to compile. Worth knowing before someone proposes it as an
   optimisation — and on x86 it buys nothing anyway, since unaligned access is
   native.
+
+  The packing is a symptom, not the problem: it is forced by the image being
+  the authoritative store. It would only go by moving the mutable state into
+  ordinary C structures and keeping the image as the read-only reference data
+  it mostly is — which means finding every image offset the original *stores*
+  in its own data, and giving up a verifier that compares whole images. That is
+  work for after everything is proven, and it trades away the property that the
+  C can be read against the disassembly. Worth recording as a stretch goal;
+  not worth doing early.
 - **Some offsets must stay offsets.** Where the original passed an image
   address in a register, or *stored* one in a structure, the value is an
   address and has to remain one. Bridge with a helper — `img_off(&gv.balls[i])`
