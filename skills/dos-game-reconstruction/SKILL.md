@@ -609,6 +609,27 @@ Two practical corollaries:
   arguments should open the game, not write a bitmap. A reconstruction whose
   default output is a file is a converter; the burden of proof is to be the
   game.
+- **Closing the window and `SIGTERM` both end the process at once, and both go
+  in on the first day.** Not when the frame is finished, not when the game loop
+  next looks — immediately, from wherever the process happens to be. *How* to
+  write the way out is under **Leaving** below; what belongs here is that it is
+  not a finishing touch.
+
+  Closing the window is the half that gets written. The signal is the half that
+  gets forgotten, and it is the one every tool depends on: `timeout`, a test
+  harness, a script that runs the port and reads its frames, a person pressing
+  Ctrl-C. **SDL is not enough on its own.** It turns a signal into an
+  `SDL_EVENT_QUIT`, which only arrives wherever the port pumps events, so a run
+  busy anywhere else ignores the signal entirely — and `timeout` without `-k`
+  then waits forever for a child that will never leave, so both processes stay.
+  Install a plain `SIGTERM`/`SIGINT`/`SIGHUP` handler beside whatever SDL does.
+
+  The cost of not having it is invisible and compounding, which is why it has
+  to be early. Here it was noticed only after **thirteen** abandoned runs had
+  been burning a core each for hours, and every measurement taken while they
+  were — frame rates, frame counts, anything with a clock in it — had to be
+  thrown away and taken again on a quiet machine. A crash announces itself;
+  this does not.
 - **Grab the mouse, and always give it a release.** A DOS game that uses the
   mouse owns it completely: it hides the driver's pointer, sets its own range
   in its own coordinates, and draws its own cursor. A window that lets the
@@ -818,11 +839,11 @@ leaves on Enter and nothing else. SDL delivers Ctrl+C as a quit *event*, the
 loop dropped it along with every other key outside A-Z, and the process could
 only be killed. A player reported it as a lock-up.
 
-**Put the way out in the IO layer, once.** A "has it closed" flag threaded
-through every transcribed loop puts a host concern inside routines that are
-meant to read as the game, and has to be remembered at every new loop — which
-is exactly how it gets missed. One function that ends the process, called from
-every quit-event site and from a `SIGINT`/`SIGTERM` handler, and no
+**Leaving: put the way out in the IO layer, once.** A "has it closed" flag
+threaded through every transcribed loop puts a host concern inside routines
+that are meant to read as the game, and has to be remembered at every new loop
+— which is exactly how it gets missed. One function that ends the process,
+called from every quit-event site and from a `SIGINT`/`SIGTERM` handler, and no
 transcribed loop needs to know it can happen.
 
 **It must `_exit`, not `exit`.** Calling the toolkit's shutdown and then
