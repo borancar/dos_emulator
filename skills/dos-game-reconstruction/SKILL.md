@@ -691,8 +691,20 @@ Practical rules, each of which was learned the hard way:
   `(offset, name, type, size, comment)` somewhere and emit the struct and its
   asserts. The generator should **refuse overlaps** — that check is worth more
   than the convenience.
-- **Offsets in hex, padding lengths in decimal.** An offset is an address; a
-  padding entry is a count of bytes, and hex invites reading it as an address.
+- **Hex for addresses, decimal for quantities.** An offset, a handler, a mask
+  and a cell value are what the program means as addresses or bit patterns, so
+  they stay hex. A padding length, a row, a column, a width, a pixel count and
+  a scan line are counts of things, and hex invites reading them as addresses.
+  `reveal[7][1092]`, not `reveal[7][0x444]`.
+
+  The disassembly spells *every* immediate in hex, so a transcription inherits
+  hex everywhere and this has to be applied deliberately. Do it as you write
+  each routine rather than as a sweep afterwards: the same literal is a
+  quantity on one line and an address on the next - a stride of `0x34` bytes
+  and a screen offset of `0x34` can sit four lines apart - so a later pass
+  cannot be done by substitution and has to be read line by line. If you do
+  end up sweeping, the check is cheap and total: the built binary should be
+  **byte-identical** before and after, because none of it changes behaviour.
 - **Records get their own types**, with the size asserted too — the entity
   node, the ball, the level, the per-player save. `sizeof(ball_t) == 0x1e`
   catches what field offsets alone cannot.
@@ -1311,6 +1323,10 @@ minimum:
 - addresses are image offsets unless written `seg:off`, and every transcribed
   routine **and every transcribed table** carries the one it came from, as a
   comment on the thing itself
+- **hex for addresses, decimal for quantities** — a row, a column, a width, a
+  pixel count, a scan line and a padding length are counts, and the
+  disassembly's all-hex immediates will otherwise carry into the C and read as
+  addresses
 - **a cited address is not a transcribed routine** — carrying an address says
   where a function came from and nothing about how much of it came across, and
   a half-transcribed routine passes the provenance check exactly as a whole
