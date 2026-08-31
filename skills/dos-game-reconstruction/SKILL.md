@@ -211,7 +211,7 @@ Any of those means stop and read the routine. It is nearly always faster than
 the rounds of measurement that follow a wrong implementation - and there is
 usually no measurement that would have caught it at all.
 
-## The order of work## The order of work
+## The order of work
 
 **1. Find out what is already known, before starting.**
 DOS-era games often have a modding community that documented the file formats
@@ -1504,6 +1504,32 @@ git subtree push --prefix=reconstruct origin master
 
 Do this from the beginning. Retrofitting the split later means rewriting the
 subdirectory's history or losing it.
+
+**The split is deterministic, and everything depends on that.** The same
+commits over the same prefix produce the same hashes every time, which is the
+only reason each update *fast-forwards* what is already published instead of
+replacing it. So it has to keep being done the same way: a different prefix, a
+`filter-branch`, or a hand-assembled commit yields different hashes, the next
+push needs `--force`, and every clone of the subtree breaks. If you ever need
+to look before you leap, do the split as its own step and check it:
+
+```sh
+git subtree split --prefix=reconstruct -b master-split
+git merge-base --is-ancestor origin/master master-split      # extends, not rewrites
+test "$(git rev-parse master-split^{tree})" = "$(git rev-parse develop:reconstruct)"
+git push origin master-split:master
+```
+
+The tree check is the one that matters. It says the split reproduces
+`develop`'s subdirectory **byte for byte**, so the published branch cannot
+quietly drift from the tree the harness verified. `master-split` is a
+throwaway: it goes stale as soon as `develop` moves, and the next split
+rebuilds it.
+
+**Tags live on `develop` and have no counterpart on `master`**, because the
+hashes differ - the two histories share messages and content but not identity,
+and they never merge. Tag milestones on `develop` and say in the tag what state
+the port was in, since a hash on the subtree cannot be pointed at.
 
 **The reconstruction directory gets its own `README.md`**, and it is a
 different document from the repository's. The top-level one explains the
