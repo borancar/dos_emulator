@@ -3266,9 +3266,12 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
     frames = 0
     paused = False
     cap_n = 0
+    snap_n = 0
     print("    controls: shift+F9 pause/resume, shift+F10 capture, "
-          "shift+F12 quit; every other key goes to the game")
-    print("    or from a shell: touch capture.request / touch pause.request")
+          "shift+F2 snapshot, shift+F12 quit; "
+          "every other key goes to the game")
+    print("    or from a shell: touch capture.request / pause.request / "
+          "snapshot.request")
 
     budget_t = time.perf_counter()
     while running:
@@ -3391,6 +3394,23 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                 elif shift and ev.key == pygame.K_F10:
                     cap_n += 1
                     capture(m, screen, f"cap{cap_n:02d}")
+                elif shift and ev.key == pygame.K_F2:
+                    # Snapshotting is the machine's own business - what a state
+                    # consists of differs from game to game - so this only
+                    # offers the key and asks. A machine that has never heard
+                    # of it says so and the run carries on, the same way
+                    # `stop_requested` above is optional.
+                    snap = getattr(m, "save_snapshot", None)
+                    if snap is None:
+                        print("  [ctl] this machine cannot snapshot")
+                    else:
+                        snap_n += 1
+                        try:
+                            where = snap(f"snap{snap_n:02d}")
+                            print(f"  [ctl] snapshot -> {where}")
+                        except Exception as e:      # a save must not end a run
+                            snap_n -= 1
+                            print(f"  [ctl] snapshot failed: {e}")
                 elif shift and ev.key in (pygame.K_F7, pygame.K_F8):
                     m.mouse_sens *= 0.8 if ev.key == pygame.K_F7 else 1.25
                     print(f"  [ctl] mouse sensitivity {m.mouse_sens:.3f} "
@@ -3457,11 +3477,24 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             print(f"  [ctl] captured on request: {note}")
 
         # File-based control, so a capture can be requested from outside the
-        # window: `touch capture.request` / `touch pause.request`.
+        # window: `touch capture.request` / `touch pause.request` /
+        # `touch snapshot.request`.
         if os.path.exists("capture.request"):
             os.remove("capture.request")
             cap_n += 1
             capture(m, screen, f"cap{cap_n:02d}")
+        if os.path.exists("snapshot.request"):
+            os.remove("snapshot.request")
+            snap = getattr(m, "save_snapshot", None)
+            if snap is None:
+                print("  [ctl] this machine cannot snapshot")
+            else:
+                snap_n += 1
+                try:
+                    print(f"  [ctl] snapshot -> {snap(f'snap{snap_n:02d}')}")
+                except Exception as e:
+                    snap_n -= 1
+                    print(f"  [ctl] snapshot failed: {e}")
         if os.path.exists("pause.request"):
             os.remove("pause.request")
             paused = not paused
