@@ -1414,21 +1414,25 @@ CGA16 = [
     (255, 85, 85), (255, 85, 255), (255, 255, 85), (255, 255, 255),
 ]
 
-# The four-colour palettes of 320x200 graphics, as attribute indices into
+# The CGA's four palettes for 320x200 graphics, as attribute indices into
 # CGA16 above.  Entry 0 is the background, which the colour-select register
-# names separately; the three foreground entries are what the palette bits
-# choose.  Keyed by (palette bit 5, intensity bit 4, mode-control bw bit 2).
-#
-# Mode 05h sets the bw bit, and on an RGB monitor that gives the third,
-# often-forgotten palette - cyan / red / white - regardless of the palette
-# bit.  Popcorn runs in mode 05h, so this is the row that matters; F8 in the
-# menu cycles the colour-select register through the others.
+# names separately; these three are what bits 5 and 4 of it - palette and
+# intensity - choose.
 CGA4 = {
-    (0, 0, 0): (2, 4, 6),      (0, 1, 0): (10, 12, 14),
-    (1, 0, 0): (3, 5, 7),      (1, 1, 0): (11, 13, 15),
-    (0, 0, 1): (3, 4, 7),      (0, 1, 1): (11, 12, 15),
-    (1, 0, 1): (3, 4, 7),      (1, 1, 1): (11, 12, 15),
+    (0, 0): (2, 4, 6),      (0, 1): (10, 12, 14),   # palette 0, dim, bright
+    (1, 0): (3, 5, 7),      (1, 1): (11, 13, 15),   # palette 1
 }
+
+# And what a **real CGA** shows instead when the colour-burst bit in the mode
+# control register is cleared - which is what BIOS mode 05h does: cyan, red
+# and white on an RGBI monitor, whatever the palette bit says.
+#
+# Off by default, because it is not what most people saw.  A card that merely
+# emulates the mode does not carry the quirk over, and by the late eighties a
+# CGA game was as likely to be running on an EGA or VGA board, where the
+# palette bit governs and mode 05h comes up in palette 1.  DOSBox does the
+# same.  Pass `rgbi=True` for a real CGA's own output.
+CGA4_RGBI = {0: (3, 4, 7), 1: (11, 12, 15)}
 
 # What each port is, so a port report reads as hardware rather than as numbers.
 # Here rather than in a reporting script because _on_in/_on_out below are the
@@ -1462,7 +1466,7 @@ class VgaDos(DosMachine):
     fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
 
     def __init__(self, exe, blaster=False, vsync_hz=60.0, hsync_hz=None,
-                 **kw):
+                 rgbi=False, **kw):
         # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
         # CGA, which is what Popcorn was written for and paces on. A VGA
         # refreshes its 200-line modes at 70 Hz, and a game that paces on the
@@ -1478,6 +1482,9 @@ class VgaDos(DosMachine):
         # fast the emulator happened to be running. Give a rate here and the
         # bit comes off the wall clock instead.
         self.hsync_hz = hsync_hz
+        # Whether the colour-burst bit picks a palette, which only a real CGA
+        # driving an RGBI monitor does.  See CGA4_RGBI.
+        self.rgbi = rgbi
         self.palette = [(0, 0, 0)] * 256
         self.dac_index = 0
         self.dac_phase = 0
@@ -2707,9 +2714,12 @@ class VgaDos(DosMachine):
         """The four (or two) colours currently displayed, as RGB triples."""
         if self.mode == 0x06:
             return [CGA16[0], CGA16[self.cga_colour & 0x0F]]
-        key = ((self.cga_colour >> 5) & 1, (self.cga_colour >> 4) & 1,
-               (self.cga_mode_ctrl >> 2) & 1)
-        return [CGA16[self.cga_colour & 0x0F]] + [CGA16[i] for i in CGA4[key]]
+        intensity = (self.cga_colour >> 4) & 1
+        if self.rgbi and (self.cga_mode_ctrl >> 2) & 1:
+            fg = CGA4_RGBI[intensity]        # a real CGA in mode 05h
+        else:
+            fg = CGA4[((self.cga_colour >> 5) & 1, intensity)]
+        return [CGA16[self.cga_colour & 0x0F]] + [CGA16[i] for i in fg]
 
     def cga_framebuffer(self):
         """Decode the 0xb8000 aperture into one byte per pixel.
@@ -3104,6 +3114,14 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                          "such as 0x1000, or it addresses past 1 MB")
     ap.add_argument("--scale", type=int, default=3)
     ap.add_argument("--blaster", action="store_true")
+    ap.add_argument("--rgbi", action="store_true",
+                    help="render 320x200 the way a real CGA drives an RGBI "
+                         "monitor: with the colour burst off - BIOS mode 05h "
+                         "- the palette bit is ignored and the screen is "
+                         "cyan, red and white. Off by default, because a game "
+                         "of this era was as likely to be played on an EGA or "
+                         "VGA board, which emulates the mode without the "
+                         "quirk and shows the palette the register asks for")
     ap.add_argument("--chunk", type=int, default=20_000,
                     help="instructions to run between display updates")
     ap.add_argument("--timer-slices", type=int, default=1,
@@ -3189,7 +3207,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
         m = make_machine(args)
     else:
         m = VgaDos(args.program, blaster=args.blaster, max_insns=1 << 62,
-                   cmdline=args.cmdline, psp_seg=args.psp_seg)
+                   cmdline=args.cmdline, psp_seg=args.psp_seg, rgbi=args.rgbi)
     audio = None
     if args.blaster and not args.no_audio and not headless:
         audio = AudioSink()
