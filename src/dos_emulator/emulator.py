@@ -2572,7 +2572,22 @@ class VgaDos(DosMachine):
         if off < 0 or off >= 0x10000:
             return
         pl = self.planes
-        self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
+
+        # **A read can be wider than a byte.** `rep movsw` out of video memory
+        # is the ordinary way to copy a planar rectangle into a buffer, and it
+        # reads a word at a time; this hook used to satisfy only the byte at
+        # `address` and leave the rest of the word to flat memory, where
+        # nothing had ever been written. The Incredible Machine saves the
+        # rectangle under its mouse pointer that way, and got every second byte
+        # back as zero - so the pointer left a trail of black wherever the
+        # screen underneath was solid. The port being checked against this drew
+        # it correctly, which made a correct reimplementation look wrong.
+        #
+        # Each byte is satisfied in turn and the latches end up holding the
+        # last address touched, as they do on the hardware.
+        if size < 1:
+            return
+        size = min(size, 0x10000 - off)
         # The VALUE a read returns, which unicorn would otherwise take from
         # flat memory - where only the last byte written to that address
         # survives, for whatever plane it belonged to.
@@ -2589,22 +2604,29 @@ class VgaDos(DosMachine):
         # right shape and the wrong colours - which read as a fault in the
         # reimplementation being checked against it.
         if self.chain4 and self.mode not in PLANAR16_MODES:
+            self.latches = [pl[0][off], pl[1][off], pl[2][off], pl[3][off]]
             return
         gc = self.gc
-        if gc[5] & 0x08:
-            # Read mode 1: each bit answers whether that pixel equals the
-            # colour compare register, considering only the planes the
-            # colour-don't-care register selects.
-            cc, dc = gc[2] & 0x0F, gc[7] & 0x0F
-            v = 0xFF
-            for p in range(4):
-                if dc & (1 << p):
-                    want = 0xFF if (cc & (1 << p)) else 0x00
-                    v &= ~(pl[p][off] ^ want) & 0xFF
-        else:
-            # Read mode 0: the plane the read map select names.
-            v = pl[gc[4] & 0x03][off]
-        self.uc.mem_write(address, bytes((v,)))
+        out = bytearray(size)
+        for i in range(size):
+            o = off + i
+            if gc[5] & 0x08:
+                # Read mode 1: each bit answers whether that pixel equals the
+                # colour compare register, considering only the planes the
+                # colour-don't-care register selects.
+                cc, dc = gc[2] & 0x0F, gc[7] & 0x0F
+                v = 0xFF
+                for p in range(4):
+                    if dc & (1 << p):
+                        want = 0xFF if (cc & (1 << p)) else 0x00
+                        v &= ~(pl[p][o] ^ want) & 0xFF
+            else:
+                # Read mode 0: the plane the read map select names.
+                v = pl[gc[4] & 0x03][o]
+            out[i] = v
+        last = off + size - 1
+        self.latches = [pl[0][last], pl[1][last], pl[2][last], pl[3][last]]
+        self.uc.mem_write(address, bytes(out))
 
     def _on_plane_write(self, uc, access, address, size, value, user):
         """Shadow writes to the 0xa0000 aperture into four separate planes.
