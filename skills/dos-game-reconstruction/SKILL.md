@@ -211,6 +211,89 @@ Any of those means stop and read the routine. It is nearly always faster than
 the rounds of measurement that follow a wrong implementation - and there is
 usually no measurement that would have caught it at all.
 
+**A `seg:off` pair with arithmetic on one half is a pointer.** Two words is
+how a 16-bit machine had to carry an address. The moment a routine does
+`off++`, `off += n` or `(uint16_t)(off + n)` while the segment sits still, it
+is holding one address, and a port with a flat memory space should hold it as
+one: build the pointer where the pair is loaded and use ordinary pointer
+arithmetic after that.
+
+Two details keep it exact. Where the original **files the offset back** into
+memory the two artefacts compare, compute it from the pointer and the segment
+it started from - that reproduces the 16-bit truncation, which is the wrap the
+original relied on. And where the offset is a **second life of a register**,
+only the life that is an address converts; the other one is a counter that
+happened to share the name.
+
+The rule stops at a pair that is *stored for something else to walk*. A
+decompression cursor kept in two globals is not a way of writing an address
+down, it is the state of the decompressor, and its readers will index memory
+by it.
+
+**So a port ends up with two spellings of a far pointer, and which one a value
+gets is decided by the code, not by taste.** Give the stored pair a type -
+`struct far_ptr { off_t off; seg_t seg; }` - and keep the host pointer for
+everything that is only dereferenced:
+
+| | when |
+| --- | --- |
+| the two words | the pair is **stored** in guest memory, **compared**, or one half is **stepped** |
+| a host pointer | the value is **only dereferenced** |
+
+The three cases that force the two-word form are worth recognising on sight:
+
+- **Stored.** The pair goes into guest memory and something else reads it back
+  as `seg:off`. A host pointer has no pair to store.
+- **Compared.** The guest tests two pairs for equality, or against zero. That
+  is a comparison of the *words* - many `seg:off` pairs address the same byte,
+  and the game does not normalise before testing, so comparing linear
+  addresses asks a different question and will sometimes answer differently.
+- **Stepped without renormalising.** The offset is advanced while the segment
+  stays put and each intermediate value is used. Those are different `seg:off`
+  pairs for addresses a host pointer would have collapsed into one.
+
+Once the type exists the operations follow it, and each is a place a hand-rolled
+line would have drifted: normalising (carry the paragraphs out of the offset
+into the segment), equality, a null constant so `(off | seg) == 0` reads as the
+question it asks, and - if the game has a record that stores the two words the
+other way round - a conversion rather than a second guess about which is which.
+
+**The boundary between the two is a conversion at the call**, and it is worth
+making it visible: the two words at rest, a host pointer in motion. A routine
+that walks segment boundaries takes the pair; one that dereferences takes the
+pointer; `MK_FP` at the call site says which is which. The give-away that a
+routine wants the pair is that it takes *the address of* one - a **near**
+pointer to a variable holding a **far** pointer, which is a distinction the
+port has to be able to write down.
+
+**A BIOS or DOS call the port cannot answer is stubbed, never dropped.** The
+`int NN` is one instruction, so a transcription that has nothing to say about
+it can simply not write a line - and then nothing marks the gap. The routine
+around it still reads as a complete transcription, every other instruction is
+there, and the comment above it is true.
+
+`mouse_move_to` is the shape. The original quarters its two arguments, files
+them at DGROUP 0x4740 and 0x4742, calls INT 33h function 4 to warp the driver's
+pointer, and answers 1. The port had the two stores and the 1 and no call, so
+the pointer never moved; the routine was verified, because a one-call
+comparison of DGROUP and the return value cannot see an absent interrupt.
+
+So the call becomes a named primitive in the IO file, taking what the registers
+took and answering what they answered, even when the answer is nothing:
+`io_bios_font_ptr` returns `{es, bp}` of zero because fonts are not
+reconstructed here, and the assignment the original makes out of ES:BP is
+written out as it stands. That leaves the deviation visible in three places -
+the primitive's comment, the verifier's `deviation=`, and STATUS.md - instead
+of nowhere.
+
+Auditing for the ones already dropped is mechanical: disassemble each
+transcribed routine from its entry to its first `ret`, and for every `int` in
+that window ask whether the port's body has anything at that point. Take the
+extent seriously, or the scan reads into the *next* routine and flags eight
+where one is real. Of the eight this found, four were that; three factor the
+call through another transcribed routine, which the scan cannot see; one was
+genuinely gone.
+
 ## The order of work
 
 **1. Find out what is already known, before starting.**
@@ -339,6 +422,52 @@ never a decision anyone made.
 If it is **hand-written assembly**, matching is not meaningfully available.
 Behavioural equivalence through differential verification is the standard, and
 every instruction is a decision someone made and worth reading as one.
+
+**And there is an intermediate step that keeps the matching door open for
+almost nothing: carry the memory-model keywords as tags.**
+
+    #ifndef __BORLANDC__
+    #  define near   /* one kind of pointer here */
+    #  define far    /* likewise */
+    #  define huge   /* likewise */
+    #endif
+
+    void far_copy(uint8_t far *dst, const uint8_t far *src, uint16_t count);
+
+On the host they erase and the type is exactly what it was, so this costs the
+running port nothing; under the original compiler they are the real keywords.
+The declaration then says which of the three pointer kinds the original meant,
+which is information the disassembly had and a modern `uint8_t *` throws away.
+
+Do it early. It is a rename, and a rename is cheap in proportion to how much
+code exists when you do it.
+
+**Prove it changed nothing rather than assuming it.** The check is that
+whatever the port generates - shims, a symbol table, the verification table -
+comes out **byte for byte identical** across the rename. If it does not, the
+difference is real and worth finding before going on.
+
+**Three things bite, and all three are found by building and running:**
+
+- **A tag erases any identifier of that name.** Something in the tree will be
+  called `near` or `far`, and a macro will silently delete it. Search *every*
+  directory that includes the header, not just the one being worked on, and
+  read the whole list rather than the first screen of it - both of those cost
+  a round here.
+- **`far_t a, b;` becomes `uint8_t far *a, b;`** when the typedef is spelled
+  out, and `b` is then not a pointer. The compiler catches it; the point is to
+  expect it.
+- **Any tool that keys on the old type *name* stops working, quietly.** A shim
+  generator deciding one guest word against two, or converting a returned host
+  pointer back into an offset, is reading the parameter's type as text. Keyed
+  on the name it stopped firing and truncated host pointers - and the comment
+  above that branch was the one explaining why it must never happen. Move
+  those onto the tag in the same commit.
+
+**A tag is a spelling, not a semantics.** On the host a `far` pointer does not
+wrap at 64K the way the real one does. Where the wrap actually matters the port
+still needs the two-word form and the explicit arithmetic; the tag documents the
+intent and, under the original compiler, restores the behaviour for free.
 
 ### The original's translation units are visible in the layout — mirror them
 
@@ -582,7 +711,21 @@ a register holding one, and a bare `int` says nothing at all. The widths are
 usually identical on a modern ABI, so getting this wrong compiles and runs and
 silently loses the one fact the type was carrying.
 
-Write this rule into the project's `CLAUDE.md` at the start — see *What goes
+**A register keeps its width.** The corollary that gets missed: when a routine
+is a transposition of code that works in `SI` and `DI`, those stay `uint16_t` —
+as parameters, as locals, and as return types. They are 16-bit registers, and a
+`uint32_t` holding one is a value that no longer wraps where the original's
+wraps. The same goes for the byte registers: a local that is `AL` is a
+`uint8_t`, and writing `uint32_t al = expr & 0xff` is the mask doing what the
+type is for.
+
+This is worth stating separately because the wide version *works* almost
+always. Offsets stay under 64K, positions stay under 256, and the truncation
+the type would have done never happens — so the mistake survives every test
+and only shows up on the one input that overflows. Write the width from what
+the register is, not from what the values reach.
+
+Write both rules into the project's `CLAUDE.md` at the start — see *What goes
 where* below. It is the convention most likely to be quietly dropped once the
 original context is gone.
 
@@ -807,6 +950,37 @@ from *agreed but every call was an early return* — the second is not evidence.
 And note that a routine whose **caller** is being sampled is never sampled
 itself, so a naive pass reports as unchecked a great many routines it ran
 straight past. Chase callers explicitly.
+
+**A check that reports on a run must first establish that the run happened.**
+Every behavioural check here decides its verdict by reading what the port
+*printed* - "level solved", a stream of sample blocks, a count of frames. None
+of those stops being true because the process died four lines later. Two checks
+were once green over a port that aborted on **every** level: one printed
+"33 of 33 solved" because the solve message really was in the output, and the
+other declared the samples identical off a single block against fifty-five,
+because it aligns by content and is deliberately happy with different depths.
+
+So make the abort greppable, have every check look at the exit status *and*
+that banner, and refuse a verdict rather than scoring what the run managed
+before it fell over. Then test the check itself in both directions - it must
+pass on a healthy port and give **no verdict** on a deliberately broken one.
+Solving and then dying is not solving.
+
+**And notice what the whole suite cannot see.** Screen comparisons compare
+pixels, save comparisons compare bytes, sound comparisons compare samples -
+none of them looks at *memory*. A buffer overrun that lands on a local which is
+written again before it is read will pass all of them indefinitely. A sanitizer
+is the only instrument here that can see it, so build one and run it whenever
+the frames or the record layouts change.
+
+Two cautions on that. Its undefined-behaviour half is largely **not** a defect
+list for this kind of port: the guest's records are packed and reached at odd
+offsets by design, so "load of misaligned address" is the model working, and
+that noise will bury the few reports that are real - shifts of negative values,
+and signed overflow, which is the one a compiler will actually act on. Sift
+rather than fix. And a developer build nobody builds cannot fail: check that
+the sanitizer target still *compiles* as part of the ordinary test run, or it
+will quietly rot until the day you need it.
 
 ### A cited address is not a transcribed routine
 
@@ -1312,6 +1486,10 @@ minimum:
 
 - **`stdint` types only**, with the reason — the rule alone reads as fussiness
   and gets dropped; the reason is what makes it stick.
+- **`SI` and `DI` are `uint16_t`, byte registers are `uint8_t`** — wherever a
+  routine is transposing operations that the original does in a register, the
+  C carries that register's width. A wider type compiles, runs, and passes
+  every test until something overflows.
 - **SDL3 for the window, input and sound — never a platform-specific library**,
   and never as an optional path beside a file writer. The port shows a screen
   by default.
