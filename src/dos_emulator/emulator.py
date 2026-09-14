@@ -1891,6 +1891,12 @@ class VgaDos(DosMachine):
         if index in (0x0C, 0x0D):             # display start address
             self.start_addr = (self.crtc.get(0x0C, 0) << 8) | \
                 self.crtc.get(0x0D, 0)
+        elif index == 0x09 and self.mode == 0x13:
+            # Maximum scan line. Mode 13h scans 400 lines and doubles each;
+            # a program that writes 0 here stops the doubling and has a
+            # 320x400 planar screen - Destruction Derby's intro pictures.
+            # A mode set puts it back (see _bios_mode_hardware).
+            self.height = 200 if (v & 0x1F) else 400
         elif index == 0x13:                   # logical line width
             self.crtc_offset = v
         elif index in (0x14, 0x17):
@@ -2498,8 +2504,11 @@ class VgaDos(DosMachine):
         self.gc = [0, 0, 0, 0, 0, 0, 0, 0x0F, 0xFF]
         self.latches = [0, 0, 0, 0]
         self.crtc[0x0C] = self.crtc[0x0D] = 0
+        self.crtc[0x09] = 0x41
         self.crtc[0x14] = 0x40
         self.crtc[0x17] = 0xA3
+        if self.mode == 0x13:
+            self.height = 200
         self.start_addr = 0
         self.start_mult = 4
         self.crtc_offset = 0
