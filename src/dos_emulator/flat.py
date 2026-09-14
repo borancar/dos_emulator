@@ -391,6 +391,12 @@ class FlatMachine(VgaDos):
             return DosMachine._dispatch_to_guest(self, intno)
         sel, eip = self._ivt(intno)
         if (sel, eip) == self._default_vector(intno):
+            # No protected-mode handler. A real-mode one - the sound
+            # driver's IRQ routine, which the driver installs into the
+            # vector table itself - gets the interrupt reflected to it, as
+            # DOS/4GW switches modes to do; the 16-bit core runs it.
+            if self._rm_vector_installed(intno):
+                return self._rm_run_isr(intno)
             return False
         esp = self.uc.reg_read(UC_X86_REG_ESP)
         ss_base = self._desc_base(self.uc.reg_read(UC_X86_REG_SS))
@@ -863,6 +869,17 @@ class FlatMachine(VgaDos):
         regs["ds"], regs["es"] = self._rm_regs[UC_X86_REG_DS], self._rm_regs[UC_X86_REG_ES]
         for r, v in save.items():
             self.uc.reg_write(r, v)
+
+    def _rm_run_isr(self, intno):
+        """Run the real-mode handler of `intno` on the 16-bit core, as an
+        interrupt: a frame that returns to the sentinel, registers the
+        handler's to save."""
+        seg, off = self._rm_ivt(intno)
+        regs = {k: 0 for k in self.RM_FIELDS}
+        regs.update(flags=0x202, es=0, ds=0, fs=0, gs=0, ip=0, cs=0, sp=0, ss=0)
+        self._rm_run(seg, off, regs, frame="int")
+        self.guest_dispatch[intno] += 1
+        return True
 
     def _rm_interrupt(self, intno, st):
         """DPMI 0300h: the program wants a real-mode interrupt run with the
