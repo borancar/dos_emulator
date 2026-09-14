@@ -193,7 +193,8 @@ class Handle:
 
 class DosMachine:
     def __init__(self, exe_path, blaster=False, verbose=True,
-                 max_insns=80_000_000, cmdline="", psp_seg=None, env_seg=None):
+                 max_insns=80_000_000, cmdline="", psp_seg=None, env_seg=None,
+                 cpu_mode=UC_MODE_16, mem_size=None):
         self.verbose = verbose
         self.cmdline = cmdline
         self.max_insns = max_insns
@@ -238,8 +239,11 @@ class DosMachine:
         self.mouse_x = 160
         self.mouse_y = 100
 
-        self.uc = Uc(UC_ARCH_X86, UC_MODE_16)
-        self.uc.mem_map(0, MEM_SIZE)
+        # An 8086 in real mode with 2 MB, unless a subclass asks otherwise:
+        # the flat-mode 386 in flat.py runs the same shim on a 32-bit CPU
+        # with a larger memory.
+        self.uc = Uc(UC_ARCH_X86, cpu_mode)
+        self.uc.mem_map(0, MEM_SIZE if mem_size is None else mem_size)
         self._load(exe_path, blaster)
         self.uc.hook_add(UC_HOOK_INTR, self._on_intr)
         self.uc.hook_add(UC_HOOK_INSN, self._on_in, None, 1, 0, UC_X86_INS_IN)
@@ -255,6 +259,47 @@ class DosMachine:
         size = (cp - 1) * 512 + cblp - hdr if cblp else cp * 512 - hdr
         image = data[hdr:hdr + size]
 
+        self._bios_setup()
+        self._env_setup(blaster)
+        self._psp_setup()
+
+        self.load_seg = self.psp_seg + 0x10
+        base = self.load_seg * 16
+        self.uc.mem_write(base, image)
+        for i in range(crlc):
+            o, s = struct.unpack_from("<HH", data, lfarlc + i * 4)
+            a = base + s * 16 + o
+            v = struct.unpack("<H", self.uc.mem_read(a, 2))[0]
+            self.uc.mem_write(a, struct.pack("<H", (v + self.load_seg) & 0xFFFF))
+
+        self.uc.reg_write(UC_X86_REG_CS, (self.load_seg + cs) & 0xFFFF)
+        self.uc.reg_write(UC_X86_REG_IP, ip)
+        self.uc.reg_write(UC_X86_REG_SS, (self.load_seg + ss) & 0xFFFF)
+        self.uc.reg_write(UC_X86_REG_SP, sp)
+        self.uc.reg_write(UC_X86_REG_DS, self.psp_seg)
+        self.uc.reg_write(UC_X86_REG_ES, self.psp_seg)
+        self.uc.reg_write(UC_X86_REG_AX, 0)
+        self.uc.reg_write(UC_X86_REG_CX, 0xFF)
+        self.uc.reg_write(UC_X86_REG_DX, self.psp_seg)
+        self.start = (self.load_seg + cs) * 16 + ip
+
+        # Where INT 21h AH=48h hands memory out from: just above the program,
+        # rounded up, and running to the usual 640K line. Real DOS on a 640K
+        # machine offers a program most of that, and a program that asks how
+        # much there is and sizes its buffers accordingly needs a believable
+        # answer.
+        img_paras = (len(image) + 15) // 16
+        arena = (self.load_seg + img_paras + minalloc + 0x10) & ~0x0F
+        self.mem_top = 0x9FFF
+        if arena >= self.mem_top:
+            arena = self.load_seg + img_paras + 0x10
+        # One free block covering everything above the program, up to the
+        # usual 640K line. `arena` blocks are (segment, paragraphs, in_use).
+        self.arena = [[arena, self.mem_top - arena, False]]
+
+    def _bios_setup(self):
+        """The BIOS data area, the stub ROM and its vectors, and the
+        diskette parameter table - what a program finds in low memory."""
         # Minimal BIOS data area: equipment word, memory size, video mode,
         # timer tick. Some DOS games read these directly instead of via BIOS.
         self.uc.mem_write(0x410, struct.pack("<H", 0x0021))   # equipment
@@ -297,6 +342,9 @@ class DosMachine:
                                                 DPT_ADDR >> 4))
         self.uc.mem_write(0x46C, struct.pack("<I", 0x00010000))  # tick count
 
+
+    def _env_setup(self, blaster):
+        """The environment block at env_seg."""
         env = b"COMSPEC=C:\\COMMAND.COM\x00PATH=C:\\\x00"
         if blaster:
             env += b"BLASTER=A220 I5 D1\x00"
@@ -305,6 +353,9 @@ class DosMachine:
         env += b"\x00\x01\x00" + self.prog_path.encode("ascii", "replace") + b"\x00"
         self.uc.mem_write(self.env_seg * 16, env)
 
+
+    def _psp_setup(self):
+        """The PSP at psp_seg, with the command tail."""
         psp = bytearray(0x100)
         psp[0:2] = b"\xcd\x20"
         struct.pack_into("<H", psp, 0x02, 0x9000)
@@ -316,39 +367,6 @@ class DosMachine:
         psp[0x81 + len(tail)] = 0x0D
         self.uc.mem_write(self.psp_seg * 16, bytes(psp))
 
-        self.load_seg = self.psp_seg + 0x10
-        base = self.load_seg * 16
-        self.uc.mem_write(base, image)
-        for i in range(crlc):
-            o, s = struct.unpack_from("<HH", data, lfarlc + i * 4)
-            a = base + s * 16 + o
-            v = struct.unpack("<H", self.uc.mem_read(a, 2))[0]
-            self.uc.mem_write(a, struct.pack("<H", (v + self.load_seg) & 0xFFFF))
-
-        self.uc.reg_write(UC_X86_REG_CS, (self.load_seg + cs) & 0xFFFF)
-        self.uc.reg_write(UC_X86_REG_IP, ip)
-        self.uc.reg_write(UC_X86_REG_SS, (self.load_seg + ss) & 0xFFFF)
-        self.uc.reg_write(UC_X86_REG_SP, sp)
-        self.uc.reg_write(UC_X86_REG_DS, self.psp_seg)
-        self.uc.reg_write(UC_X86_REG_ES, self.psp_seg)
-        self.uc.reg_write(UC_X86_REG_AX, 0)
-        self.uc.reg_write(UC_X86_REG_CX, 0xFF)
-        self.uc.reg_write(UC_X86_REG_DX, self.psp_seg)
-        self.start = (self.load_seg + cs) * 16 + ip
-
-        # Where INT 21h AH=48h hands memory out from: just above the program,
-        # rounded up, and running to the usual 640K line. Real DOS on a 640K
-        # machine offers a program most of that, and a program that asks how
-        # much there is and sizes its buffers accordingly needs a believable
-        # answer.
-        img_paras = (len(image) + 15) // 16
-        arena = (self.load_seg + img_paras + minalloc + 0x10) & ~0x0F
-        self.mem_top = 0x9FFF
-        if arena >= self.mem_top:
-            arena = self.load_seg + img_paras + 0x10
-        # One free block covering everything above the program, up to the
-        # usual 640K line. `arena` blocks are (segment, paragraphs, in_use).
-        self.arena = [[arena, self.mem_top - arena, False]]
 
     # ----------------------------------------------------------------- utils
     @staticmethod
@@ -364,8 +382,22 @@ class DosMachine:
         """
         return 0x80 if handle in (0, 1, 2) else 0x00
 
+    def _lin(self, seg, off):
+        """The linear address of seg:off - a real-mode segment here; a
+        selector with a base in the flat-mode subclass."""
+        return seg * 16 + off
+
+    def pc(self):
+        """The linear address of the next instruction."""
+        return self._reg(UC_X86_REG_CS) * 16 + self._reg(UC_X86_REG_IP)
+
+    def _rewind(self, n):
+        """Back the instruction pointer up over the INT just serviced, so a
+        call that must block re-executes when the outer loop comes back."""
+        self._set(UC_X86_REG_IP, (self._reg(UC_X86_REG_IP) - n) & 0xFFFF)
+
     def _rd(self, seg, off, n):
-        return bytes(self.uc.mem_read(seg * 16 + off, n))
+        return bytes(self.uc.mem_read(self._lin(seg, off), n))
 
     def _str(self, seg, off, maxlen=128):
         b = self._rd(seg, off, maxlen)
@@ -977,8 +1009,8 @@ class DosMachine:
             # DS:SI gets the path WITHOUT a leading backslash and without the
             # drive, which is why the root is the empty string rather than
             # "\\".
-            self.uc.mem_write(self._reg(UC_X86_REG_DS) * 16 +
-                              self._reg(UC_X86_REG_SI),
+            self.uc.mem_write(self._lin(self._reg(UC_X86_REG_DS),
+                                        self._reg(UC_X86_REG_SI)),
                               self.cwd.encode("ascii", "replace") + b"\x00")
             self._set(UC_X86_REG_AX, 0x0100)
             return
@@ -1072,7 +1104,7 @@ class DosMachine:
                 self._set(UC_X86_REG_AX, 6)
                 return
             chunk = h.data[h.pos:h.pos + cx]
-            self.uc.mem_write(ds * 16 + dx, bytes(chunk))
+            self.uc.mem_write(self._lin(ds, dx), bytes(chunk))
             h.pos += len(chunk)
             self._set(UC_X86_REG_AX, len(chunk))
             return
@@ -2227,8 +2259,7 @@ class VgaDos(DosMachine):
             # is a status poll and must answer 0 rather than wait.
             if (ah != 0x06 and self.pending_scan is None
                     and not self.key_buf):
-                self._set(UC_X86_REG_IP,
-                          (self._reg(UC_X86_REG_IP) - 2) & 0xFFFF)
+                self._rewind(2)
                 self.blocked_on_input = True
                 self.uc.emu_stop()
                 return
@@ -3296,9 +3327,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                       None, code_base, code_base + 0x10000)
         print(f"    [keys] {len(triggers)} code triggers armed")
 
-    cs = m._reg(UC_X86_REG_CS)
-    ip = m._reg(UC_X86_REG_IP)
-    addr = cs * 16 + ip
+    addr = m.pc()
     running = True
     shots_taken = 0
     next_shot = args.shot_every
@@ -3328,12 +3357,12 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
             if hit is not None:
                 print(f"  [ctl] stopped at {hit:#07x}; `cont` to resume")
                 m.ctl_hit = None
-            addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
+            addr = m.pc()
             time.sleep(0.01)
         elif not paused:
             # A `step` or `until` over the socket has just moved CS:IP, and
             # resuming from the address the loop was holding would jump back.
-            addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
+            addr = m.pc()
             slice_start = time.perf_counter()
             m.blocked_on_input = False
             # Run the chunk in slices, servicing sound between each. A whole
@@ -3366,11 +3395,11 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                 if getattr(m, "quit_requested", False):
                     running = False
                     break
-                addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
+                addr = m.pc()
                 m.service_sound()
                 m.service_keyboard()
                 m.service_timer()
-                addr = m._reg(UC_X86_REG_CS) * 16 + m._reg(UC_X86_REG_IP)
+                addr = m.pc()
             if audio is not None:
                 audio.push(m.sb)
 

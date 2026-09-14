@@ -49,6 +49,8 @@ from .emulator import (
     XMS_INT,
 )
 from .sb import SoundBlaster
+from .flat import FlatMachine
+from .le import LE
 from .xms import XMS
 from .control import Control
 
