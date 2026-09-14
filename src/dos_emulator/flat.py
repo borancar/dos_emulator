@@ -169,6 +169,7 @@ class FlatMachine(VgaDos):
 
     fs_note = ("host filesystem READ-ONLY; writes intercepted in memory; "
                "386 flat mode, DOS/4GW services")
+    mode_set_resets_hardware = True
 
     def __init__(self, exe, load_delta=LE.DEFAULT_DELTA, mem_size=32 << 20,
                  trace_blocks=0, **kw):

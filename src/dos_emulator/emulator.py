@@ -1761,6 +1761,20 @@ class VgaDos(DosMachine):
 
     # ------------------------------------------------------------- ports
     def _on_out(self, uc, port, size, value, user):
+        # A word or dword OUT to an 8-bit device is consecutive bytes on
+        # consecutive ports - which is the point of `out dx, ax` to 0x3C4:
+        # the index in AL and the data in AH in one instruction. Watcom's
+        # outpw() is how Destruction Derby sets its map mask, and taking
+        # only the low byte left the mask where the BIOS put it, so every
+        # plane's pixels landed in plane 0 and the race drew as stripes.
+        if size == 2:
+            self._on_out(uc, port, 1, value & 0xFF, user)
+            self._on_out(uc, port + 1, 1, (value >> 8) & 0xFF, user)
+            return
+        if size == 4:
+            for i in range(4):
+                self._on_out(uc, port + i, 1, (value >> (8 * i)) & 0xFF, user)
+            return
         # Any port write means the guest is doing something, so it is not
         # sitting in a retrace spin - see da_streak in _on_in.
         self.da_streak = 0
@@ -1920,6 +1934,12 @@ class VgaDos(DosMachine):
         return (load - int(PIT_HZ * (el - self.pit_load_t[ch]))) & 0xFFFF
 
     def _on_in(self, uc, port, size, user):
+        if size == 2:
+            return (self._on_in(uc, port, 1, user) & 0xFF
+                    | (self._on_in(uc, port + 1, 1, user) & 0xFF) << 8)
+        if size == 4:
+            return sum((self._on_in(uc, port + i, 1, user) & 0xFF) << (8 * i)
+                       for i in range(4))
         self.port_in[port] += 1
         n = self.port_in[port]
         el = self._elapsed()
@@ -2466,6 +2486,29 @@ class VgaDos(DosMachine):
         self.uc.mem_write(addr, bytes([
             ((cur ^ val) if (al & 0x80) else ((cur & ~mask) | val)) & 0xFF]))
 
+    mode_set_resets_hardware = False
+
+    def _bios_mode_hardware(self):
+        """What a VGA BIOS mode set programs into the sequencer, the
+        Graphics Controller and the CRTC, for the modes modelled here: the
+        sequencer chained and every plane enabled, the GC at its reset
+        state, the CRTC in doubleword mode with the start address at 0."""
+        self.chain4 = self.mode not in PLANAR16_MODES
+        self.map_mask = 0x0F
+        self.gc = [0, 0, 0, 0, 0, 0, 0, 0x0F, 0xFF]
+        self.latches = [0, 0, 0, 0]
+        self.crtc[0x0C] = self.crtc[0x0D] = 0
+        self.crtc[0x14] = 0x40
+        self.crtc[0x17] = 0xA3
+        self.start_addr = 0
+        self.start_mult = 4
+        self.crtc_offset = 0
+        if self.mode == 0x13:
+            self.crtc[0x13] = 40
+            self.crtc_offset = 40
+        for p in self.planes:
+            p[:] = bytes(len(p))
+
     def _bios_video(self):
         ax = self._reg(UC_X86_REG_AX)
         ah, al = ax >> 8, ax & 0xFF
@@ -2568,13 +2611,20 @@ class VgaDos(DosMachine):
             # EGA_DEFAULT_ATTR.
             self.attr_pal = default_attr_palette(self.mode)
             self.attr_flipflop = False
-            # NOT reset here: chain4, the Graphics Controller and the latches.
-            # A BIOS mode set really does reset all three, and doing so was
-            # tried - it turned PC Lemmings' play screen black from the first
-            # frame, which says something else in this emulator depends on
-            # them surviving a mode set. Correct-looking and wrong is worse
-            # than the status quo, so it stays out until that dependency is
-            # found.
+            # NOT reset here by default: chain4, the Graphics Controller and
+            # the latches. A BIOS mode set really does reset all three, and
+            # doing so was tried - it turned PC Lemmings' play screen black
+            # from the first frame, which says something else in this
+            # emulator depends on them surviving a mode set. Correct-looking
+            # and wrong is worse than the status quo, so it stays out until
+            # that dependency is found.
+            #
+            # A machine that says `mode_set_resets_hardware = True` gets what
+            # the BIOS does. Destruction Derby needs it: it unchains mode 13h
+            # for its menus, then sets mode 13h again for the race and draws
+            # it linear, trusting the BIOS to have put chain-4 back.
+            if self.mode_set_resets_hardware:
+                self._bios_mode_hardware()
             if self.mode in CGA_MODES:
                 # What the BIOS leaves in the two CGA registers for each mode.
                 # Popcorn never writes 0x3d8 itself, so getting this wrong
