@@ -30,11 +30,22 @@ mouse and timer as the 8086 machine - `VgaDos` with a different CPU. It
 was built for Destruction Derby (Reflections / Psygnosis, 1995) and knows
 nothing about it: what is game-specific lives in that project's subclass.
 
-The one thing it does not do is run 16-bit code. A real-mode procedure the
-program asks for through DPMI 0301h - a Miles sound driver's entry point, a
-mouse driver's - is a hardware-facing thing on the other side of the
-boundary, and a subclass answers it natively through `rm_call`.
+Real-mode code the program loads and asks for - a Miles sound driver
+reached through a simulated INT 66h, a far procedure through DPMI 0301h -
+runs on a **second, 16-bit core** over the same memory (`_rm_run`). The
+32-bit core is stopped while it does, which is what a DPMI host's mode
+switch amounts to; ports and DOS calls the driver makes go to the same shim.
+A subclass can still answer a call natively through `rm_interrupt` and
+`rm_call`, which come first.
+
+The call is *deferred*: the DPMI hook records it and stops the 32-bit core,
+and `service_deferred()` performs it from the main loop. That is not
+fussiness. A hardware interrupt that arrives while real-mode code runs goes
+to the program's protected-mode handler first, as a DPMI host reflects it,
+and running that handler means running the 32-bit core - which cannot be
+re-entered from inside its own interrupt hook. Between slices it can.
 """
+import ctypes
 import struct
 
 from unicorn import *
@@ -42,6 +53,17 @@ from unicorn.x86_const import *
 
 from .emulator import VgaDos, DosMachine, BIOS_STUB_SEG
 from .le import LE
+
+# Where a simulated real-mode call comes back to: a `hlt` in the ROM area
+# that the 16-bit core is told to stop at. The frame pushed for the driver
+# names this as its return address. PM_SENTINEL_OFF is the same for a
+# protected-mode handler run while a real-mode call is in progress.
+RM_SENTINEL_OFF = 0x00C0
+PM_SENTINEL_OFF = 0x00D0
+# How much real-mode code one call may run before it is called runaway, and
+# how often the card and the timer get a look in while it runs.
+RM_CALL_BUDGET = 20_000_000
+RM_SLICE = 20_000
 
 # Where the descriptor table lives: in the ROM area, beside the BIOS stubs,
 # where no DOS program has any business writing. 8 KB is 1,024 descriptors.
@@ -151,6 +173,13 @@ class FlatMachine(VgaDos):
     def __init__(self, exe, load_delta=LE.DEFAULT_DELTA, mem_size=32 << 20,
                  trace_blocks=0, **kw):
         self.load_delta = load_delta
+        # The RAM, as a host buffer both cores map.
+        self.mem_buf = ctypes.create_string_buffer(mem_size)
+        self.rm_uc = None
+        self.rm_trace = bool(trace_blocks)
+        self.pending_rm = None       # a real-mode call the hook put off
+        self._rm_mode = False        # True while the 16-bit core is the CPU
+        self.rm_calls = 0
         # `trace_blocks=N` keeps the last N basic-block starts, printed with
         # a fault. It costs a hook per block, so it is off unless asked for.
         self.block_ring = None
@@ -166,7 +195,9 @@ class FlatMachine(VgaDos):
         self.seg_selectors = {}      # RM segment -> selector, for 0002
         self._rm_context = False
         self.gdt_used = SEL_FIRST_FREE // 8
-        super().__init__(exe, cpu_mode=UC_MODE_32, mem_size=mem_size, **kw)
+        super().__init__(exe, cpu_mode=UC_MODE_32, mem_size=mem_size,
+                         mem_buf=self.mem_buf, **kw)
+        self._pm_uc = self.uc
         # The 32-bit CPU faults on a segment load the descriptor table does
         # not cover; the base class's INT 08h/09h dispatch would push a
         # 16-bit frame. Both are overridden below; nothing else in VgaDos
@@ -194,9 +225,13 @@ class FlatMachine(VgaDos):
         self._env_setup(blaster)
         self._psp_setup()
 
-        # Objects above the first megabyte; the zeros below them are the
-        # conventional memory the PSP and DOS allocations live in.
-        self.uc.mem_write(0, bytes(image))
+        # The objects, above the first megabyte. Only their bytes: the image
+        # is zero below the first object, and writing that would wipe the
+        # vector table and the BIOS data area just set up - which it did,
+        # and the sound driver then read the CRTC base as 0 and polled
+        # port 6 for a retrace that never came.
+        lo = min(o.base for o in self.le.objects) + self.load_delta
+        self.uc.mem_write(lo, bytes(image[lo:]))
         self.image_end = (len(image) + 0xFFF) & ~0xFFF
 
         # The descriptor table, and the four selectors the program starts
@@ -233,6 +268,15 @@ class FlatMachine(VgaDos):
         arena = self.psp_seg + 0x10
         self.mem_top = 0x9FFF
         self.arena = [[arena, self.mem_top - arena, False]]
+        # The stack a simulated real-mode call runs on when the caller's
+        # structure names none (SS:SP = 0), as the DPMI host provides one.
+        self.rm_stack_seg = self._mem_alloc(0x100)
+        self.uc.mem_write(BIOS_STUB_SEG * 16 + RM_SENTINEL_OFF, b"\xf4")
+        self.uc.mem_write(BIOS_STUB_SEG * 16 + PM_SENTINEL_OFF, b"\xf4")
+        # What the interrupt vector table holds before the program touches
+        # it: a vector that still reads this way has no real-mode handler,
+        # and a simulated interrupt to it is answered by the shim instead.
+        self.ivt_boot = bytes(self.uc.mem_read(0, 0x400))
         # Extended memory: from the end of the image to the end of RAM.
         self.ext_free = [[self.image_end, self.mem_size - self.image_end]]
 
@@ -274,11 +318,16 @@ class FlatMachine(VgaDos):
 
     # ------------------------------------------------------------ registers
     def _reg(self, r):
+        if self._rm_mode:
+            return self.uc.reg_read(r)
         if self._rm_context and r in self._rm_regs:
             return self._rm_regs[r]
         return self.uc.reg_read(WIDE.get(r, r))
 
     def _set(self, r, v):
+        if self._rm_mode:
+            self.uc.reg_write(r, v & 0xFFFF)
+            return
         if self._rm_context and r in self._rm_regs:
             self._rm_regs[r] = v & 0xFFFF
             return
@@ -291,14 +340,18 @@ class FlatMachine(VgaDos):
         self.uc.reg_write(WIDE.get(r, r), v & 0xFFFFFFFF)
 
     def _lin(self, seg, off):
-        if self._rm_context:
+        if self._rm_context or self._rm_mode:
             return (seg * 16 + off) & 0xFFFFF
         return self._desc_base(seg) + off
 
     def pc(self):
+        if self._rm_mode:
+            return DosMachine.pc(self)
         return self.uc.reg_read(UC_X86_REG_EIP)
 
     def _rewind(self, n):
+        if self._rm_mode:
+            return DosMachine._rewind(self, n)
         self.uc.reg_write(UC_X86_REG_EIP, self.uc.reg_read(UC_X86_REG_EIP) - n)
 
     # --------------------------------------------------------- interrupts
@@ -309,12 +362,32 @@ class FlatMachine(VgaDos):
     def _ivt(self, intno):
         """The protected-mode vector, in the (seg, off) shape the shim
         compares - here (selector, eip). Never empty: what the program has
-        not replaced is the default stub, as under DOS/4GW."""
+        not replaced is the default stub, as under DOS/4GW. On the 16-bit
+        core it is the real interrupt vector table."""
+        if self._rm_mode:
+            return DosMachine._ivt(self, intno)
         return self.pm_vectors.get(intno) or self._default_vector(intno)
+
+    def _rm_ivt(self, intno):
+        off, seg = struct.unpack("<HH", bytes(self.uc.mem_read(intno * 4, 4)))
+        return seg, off
+
+    def _rm_vector_installed(self, intno):
+        return bytes(self.uc.mem_read(intno * 4, 4)) != self.ivt_boot[intno * 4: intno * 4 + 4]
 
     def _dispatch_to_guest(self, intno):
         """Raise INT `intno` in the program: a 32-bit frame, IF and TF off,
-        and the handler's `iretd` comes back to where the guest was."""
+        and the handler's `iretd` comes back to where the guest was.
+
+        While the 16-bit core is running, a protected-mode handler the
+        program installed still comes first - the DPMI host reflects
+        hardware interrupts to it - and runs to its `iretd` on the 32-bit
+        core before the real-mode code continues. Only a vector the program
+        left alone goes to the real interrupt vector table."""
+        if self._rm_mode:
+            if intno in self.pm_vectors:
+                return self._run_pm_handler(intno)
+            return DosMachine._dispatch_to_guest(self, intno)
         sel, eip = self._ivt(intno)
         if (sel, eip) == self._default_vector(intno):
             return False
@@ -345,7 +418,7 @@ class FlatMachine(VgaDos):
         return bytes(self.uc.mem_read(eip - 2, 2)) == bytes((0xCD, intno))
 
     def _on_intr(self, uc, intno, user):
-        if intno == 0x31:
+        if intno == 0x31 and not self._rm_mode:
             self.int_counts[intno] += 1
             return self._dpmi()
         if intno < 0x20 and intno in self.EXCEPTIONS and not self._is_soft_int(intno):
@@ -381,7 +454,10 @@ class FlatMachine(VgaDos):
     # ------------------------------------------------------------ INT 21h
     def _dos(self):
         """DOS as DOS/4GW presents it: vectors are protected-mode, memory
-        comes back as selectors, and the extender answers a few of its own."""
+        comes back as selectors, and the extender answers a few of its own.
+        From the 16-bit core it is plain DOS."""
+        if self._rm_mode:
+            return super()._dos()
         ax = self._reg(UC_X86_REG_AX)
         ah, al = ax >> 8, ax & 0xFF
         if ah == 0x25:
@@ -572,13 +648,14 @@ class FlatMachine(VgaDos):
             self._write_desc(dx, base, bx * 16 - 1 if bx else 0, access, flags)
             return
         if ax == 0x0200:
-            seg, off = self.rm_vectors.get(ebx & 0xFF, (0, 0))
+            seg, off = self._rm_ivt(ebx & 0xFF)
             w16(UC_X86_REG_ECX, seg)
             w16(UC_X86_REG_EDX, off)
             return
         if ax == 0x0201:
+            self.uc.mem_write((ebx & 0xFF) * 4, struct.pack("<HH", dx, cx))
             self.rm_vectors[ebx & 0xFF] = (cx, dx)
-            self._note(f"DPMI set RM vector {ebx & 0xFF:02x}h -> {cx:04x}:{dx:04x}")
+            self._fop(f"DPMI set RM vector {ebx & 0xFF:02x}h -> {cx:04x}:{dx:04x}")
             return
         if ax == 0x0202:
             sel, eip = self.exc_handlers.get(ebx & 0xFF, (SEL_CODE, 0))
@@ -598,10 +675,13 @@ class FlatMachine(VgaDos):
             self.hooked_vectors[ebx & 0xFF] = (cx, edx)
             self._note(f"DPMI set PM vector {ebx & 0xFF:02x}h -> {cx:04x}:{edx:08x}")
             return
-        if ax == 0x0300:
-            return self._rm_interrupt(ebx & 0xFF, self._desc_base(self.uc.reg_read(UC_X86_REG_ES)) + edi)
-        if ax in (0x0301, 0x0302):
-            return self._rm_procedure(ax, self._desc_base(self.uc.reg_read(UC_X86_REG_ES)) + edi)
+        if ax in (0x0300, 0x0301, 0x0302):
+            # Performed by service_deferred(), outside this hook; the core
+            # stops here and resumes after the `int 31h` once it is done.
+            st = self._desc_base(self.uc.reg_read(UC_X86_REG_ES)) + edi
+            self.pending_rm = (ax, ebx & 0xFF, st)
+            self.uc.emu_stop()
+            return
         if ax == 0x0303:
             pm = (self.uc.reg_read(UC_X86_REG_DS), esi)
             st = self._desc_base(self.uc.reg_read(UC_X86_REG_ES)) + edi
@@ -791,6 +871,12 @@ class FlatMachine(VgaDos):
             self._rm_write(st, regs)
             self._cf(False)
             return
+        if self._rm_vector_installed(intno):
+            seg, off = self._rm_ivt(intno)
+            self._rm_run(seg, off, regs, frame="int")
+            self._rm_write(st, regs)
+            self._cf(False)
+            return
         if intno == 0x2F:
             # The multiplex interrupt: nothing is installed here. AX=1500h
             # asks MSCDEX how many CD-ROM drives there are, and BX=0 with
@@ -822,10 +908,168 @@ class FlatMachine(VgaDos):
             self._rm_write(st, regs)
             self._cf(False)
             return
-        self._fop(f"UNHANDLED DPMI {fn:04x}h RM call {regs['cs']:04x}:{regs['ip']:04x} "
-                  f"AX={regs['eax'] & 0xFFFF:04x} BX={regs['ebx'] & 0xFFFF:04x} "
-                  f"at {self.pc():#x}")
-        return self._dpmi_fail(0x8021)
+        self._rm_run(regs["cs"], regs["ip"], regs,
+                     frame="int" if fn == 0x0302 else "far")
+        self._rm_write(st, regs)
+        self._cf(False)
+
+    def service_deferred(self):
+        if self.pending_rm is None:
+            return
+        ax, intno, st = self.pending_rm
+        self.pending_rm = None
+        if ax == 0x0300:
+            self._rm_interrupt(intno, st)
+        else:
+            self._rm_procedure(ax, st)
+
+    def _run_pm_handler(self, intno):
+        """Run the program's protected-mode handler for `intno` on the 32-bit
+        core, now, and come back: for an interrupt that arrives while the
+        16-bit core has the machine. The 32-bit core is stopped inside the
+        DPMI call that started the real-mode code; its stack is the
+        program's, and the frame pushed here returns to a `hlt` the core is
+        told to stop at, after which its instruction pointer is put back."""
+        pm = self._pm_uc
+        sel, eip = self.pm_vectors[intno]
+        saved_eip = pm.reg_read(UC_X86_REG_EIP)
+        esp = pm.reg_read(UC_X86_REG_ESP)
+        ss_base = self._desc_base(pm.reg_read(UC_X86_REG_SS))
+        flags = pm.reg_read(UC_X86_REG_EFLAGS)
+        sentinel = BIOS_STUB_SEG * 16 + PM_SENTINEL_OFF
+        for val in (flags, SEL_CODE, sentinel):
+            esp -= 4
+            pm.mem_write(ss_base + esp, struct.pack("<I", val))
+        pm.reg_write(UC_X86_REG_ESP, esp)
+        pm.reg_write(UC_X86_REG_EFLAGS, flags & ~0x300)
+        pm.reg_write(UC_X86_REG_CS, sel)
+        pm.reg_write(UC_X86_REG_EIP, eip)
+        self.guest_dispatch[intno] += 1
+        rm_uc = self.uc
+        self.uc, self._rm_mode = pm, False
+        try:
+            pm.emu_start(eip, sentinel, count=RM_CALL_BUDGET)
+        except UcError as e:
+            self._fop(f"PM handler {intno:02x}h fault {e} at {pm.reg_read(UC_X86_REG_EIP):#x}")
+        finally:
+            self.uc, self._rm_mode = rm_uc, True
+        if pm.reg_read(UC_X86_REG_EIP) != sentinel:
+            self._fop(f"PM handler {intno:02x}h did not return: at {pm.reg_read(UC_X86_REG_EIP):#x}")
+        pm.reg_write(UC_X86_REG_EIP, saved_eip)
+        return True
+
+    # ---------------------------------------------------- the 16-bit core
+    def _rm_core(self):
+        """The 16-bit core, made on first use, over the first megabyte and
+        the HMA of the same RAM."""
+        if self.rm_uc is None:
+            rm = Uc(UC_ARCH_X86, UC_MODE_16)
+            rm.mem_map_ptr(0, 0x110000, UC_PROT_ALL, self.mem_buf)
+            rm.hook_add(UC_HOOK_INTR, self._on_intr)
+            rm.hook_add(UC_HOOK_INSN, self._on_in, None, 1, 0, UC_X86_INS_IN)
+            rm.hook_add(UC_HOOK_INSN, self._on_out, None, 1, 0, UC_X86_INS_OUT)
+            rm.hook_add(UC_HOOK_MEM_UNMAPPED, self._on_unmapped)
+            if self.block_ring is not None:
+                rm.hook_add(UC_HOOK_BLOCK, self._on_block)
+            self.rm_uc = rm
+        return self.rm_uc
+
+    def _rm_run(self, cs, ip, regs, frame):
+        """Run real-mode code at cs:ip on the 16-bit core with the registers
+        of a DPMI call structure, until it returns to the sentinel, and put
+        the registers back. `frame` is "int" for an interrupt-style entry
+        (flags pushed, the handler ends in `iret`) or "far" (a `retf`)."""
+        rm = self._rm_core()
+        ss, sp = regs["ss"], regs["sp"]
+        if ss == 0 and sp == 0:
+            ss, sp = self.rm_stack_seg, 0x1000
+        if frame == "int":
+            sp -= 2
+            rm.mem_write(ss * 16 + sp, struct.pack("<H", regs["flags"] | 0x200))
+        sp -= 4
+        rm.mem_write(ss * 16 + sp, struct.pack("<HH", RM_SENTINEL_OFF, BIOS_STUB_SEG))
+        for name, r in (("eax", UC_X86_REG_EAX), ("ebx", UC_X86_REG_EBX),
+                        ("ecx", UC_X86_REG_ECX), ("edx", UC_X86_REG_EDX),
+                        ("esi", UC_X86_REG_ESI), ("edi", UC_X86_REG_EDI),
+                        ("ebp", UC_X86_REG_EBP)):
+            rm.reg_write(r, regs[name])
+        for name, r in (("ds", UC_X86_REG_DS), ("es", UC_X86_REG_ES),
+                        ("fs", UC_X86_REG_FS), ("gs", UC_X86_REG_GS)):
+            rm.reg_write(r, regs[name])
+        rm.reg_write(UC_X86_REG_SS, ss)
+        rm.reg_write(UC_X86_REG_SP, sp)
+        rm.reg_write(UC_X86_REG_CS, cs)
+        rm.reg_write(UC_X86_REG_IP, ip)
+        rm.reg_write(UC_X86_REG_EFLAGS, (regs["flags"] & 0xFFFF & ~0x100) | 0x2)
+        self.rm_calls += 1
+        if self.rm_trace:
+            print(f"  [rm] call {cs:04x}:{ip:04x} AX={regs['eax'] & 0xFFFF:04x} "
+                  f"BX={regs['ebx'] & 0xFFFF:04x} CX={regs['ecx'] & 0xFFFF:04x} "
+                  f"DX={regs['edx'] & 0xFFFF:04x} t={self._elapsed():.4f}")
+        self.uc, self._rm_mode = rm, True
+        sentinel = BIOS_STUB_SEG * 16 + RM_SENTINEL_OFF
+        try:
+            # In slices, with the card and the timer serviced between them:
+            # a DPMI host delivers hardware interrupts to real mode while
+            # real-mode code runs, and the sound driver's IRQ test spins
+            # until its own handler - in the real interrupt vector table -
+            # has seen the interrupt its four-byte DMA transfer raises.
+            at = cs * 16 + ip
+            spent = 0
+            while spent < RM_CALL_BUDGET:
+                rm.emu_start(at, sentinel, count=RM_SLICE)
+                spent += RM_SLICE
+                at = rm.reg_read(UC_X86_REG_CS) * 16 + rm.reg_read(UC_X86_REG_IP)
+                if at == sentinel or self.finished:
+                    break
+                irqs = self.sb_irqs
+                self.service_sound()
+                self.service_timer()
+                if self.rm_trace and self.sb is not None and (self.sb.irq_pending or irqs != self.sb_irqs):
+                    print(f"  [rm] t={self._elapsed():.4f} spent={spent} pending={self.sb.irq_pending} "
+                          f"delivered={self.sb_irqs - irqs} IF={bool(rm.reg_read(UC_X86_REG_EFLAGS) & 0x200)} "
+                          f"dma_active={self.sb.dma_active} at={at:#x}")
+                at = rm.reg_read(UC_X86_REG_CS) * 16 + rm.reg_read(UC_X86_REG_IP)
+        except UcError as e:
+            self._fop(f"RM core fault {e} at {DosMachine.pc(self):#x} "
+                      f"(call from {cs:04x}:{ip:04x} AX={regs['eax'] & 0xFFFF:04x})")
+        finally:
+            self.uc, self._rm_mode = self._pm_uc, False
+        at = rm.reg_read(UC_X86_REG_CS) * 16 + rm.reg_read(UC_X86_REG_IP)
+        if at != BIOS_STUB_SEG * 16 + RM_SENTINEL_OFF:
+            sb = self.sb
+            self._fop(f"RM call {cs:04x}:{ip:04x} AX={regs['eax'] & 0xFFFF:04x} "
+                      f"did not return: stopped at {at:#x}; IF={bool(rm.reg_read(UC_X86_REG_EFLAGS) & 0x200)} "
+                      + (f"sb irq_pending={sb.irq_pending} enabled={sb.irq_enabled()} "
+                         f"mask={sb.pic_mask:#04x} dma_active={sb.dma_active} "
+                         f"ivt[{0x08 + sb.irq:02x}]={self._rm_ivt(0x08 + sb.irq)} "
+                         f"sb_irqs={self.sb_irqs}" if sb else "")
+                      + f" CX={rm.reg_read(UC_X86_REG_ECX):#x} AX={rm.reg_read(UC_X86_REG_EAX):#x}"
+                        f" in3da={self.port_in[0x3DA]} elapsed={self._elapsed():.2f}s")
+            if self.block_ring:
+                print("  [rm] last blocks: " + " ".join(f"{a:#x}" for a in self.block_ring))
+            try:
+                from capstone import Cs, CS_ARCH_X86, CS_MODE_16
+                lo = min(self.block_ring) if self.block_ring else at
+                code = bytes(rm.mem_read(lo, min(64, at + 32 - lo)))
+                for ins in Cs(CS_ARCH_X86, CS_MODE_16).disasm(code, lo):
+                    print(f"  [rm]   {ins.address:05x} {ins.bytes.hex():14s} {ins.mnemonic} {ins.op_str}")
+            except Exception as e:      # diagnostics only
+                print(f"  [rm] (no disassembly: {e})")
+        for name, r in (("eax", UC_X86_REG_EAX), ("ebx", UC_X86_REG_EBX),
+                        ("ecx", UC_X86_REG_ECX), ("edx", UC_X86_REG_EDX),
+                        ("esi", UC_X86_REG_ESI), ("edi", UC_X86_REG_EDI),
+                        ("ebp", UC_X86_REG_EBP)):
+            regs[name] = rm.reg_read(r)
+        for name, r in (("ds", UC_X86_REG_DS), ("es", UC_X86_REG_ES),
+                        ("fs", UC_X86_REG_FS), ("gs", UC_X86_REG_GS)):
+            regs[name] = rm.reg_read(r)
+        regs["flags"] = rm.reg_read(UC_X86_REG_EFLAGS) & 0xFFFF
+        if frame == "int":
+            # The flags an `iret` popped are the caller's; what the handler
+            # returns in the structure is the flags it *left*, which for an
+            # interrupt-style call means the frame's copy. Take the CPU's.
+            pass
 
     def rm_call(self, regs):
         """Answer a real-mode far call natively. `regs` is the call structure
@@ -842,6 +1086,7 @@ class FlatMachine(VgaDos):
     # ------------------------------------------------------------ report
     def report(self, out=print):
         super().report(out)
+        out(f"=== real-mode calls run on the 16-bit core: {self.rm_calls} ===")
         out("=== DPMI functions used ===")
         for ax, c in sorted(self.dpmi_counts.items()):
             out(f"  AX={ax:04x}h x{c:<6} {DPMI_FN.get(ax, '?')}")

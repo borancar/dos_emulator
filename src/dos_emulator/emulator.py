@@ -194,7 +194,7 @@ class Handle:
 class DosMachine:
     def __init__(self, exe_path, blaster=False, verbose=True,
                  max_insns=80_000_000, cmdline="", psp_seg=None, env_seg=None,
-                 cpu_mode=UC_MODE_16, mem_size=None):
+                 cpu_mode=UC_MODE_16, mem_size=None, mem_buf=None):
         self.verbose = verbose
         self.cmdline = cmdline
         self.max_insns = max_insns
@@ -242,8 +242,16 @@ class DosMachine:
         # An 8086 in real mode with 2 MB, unless a subclass asks otherwise:
         # the flat-mode 386 in flat.py runs the same shim on a 32-bit CPU
         # with a larger memory.
+        # `mem_buf` is a host buffer to use as the guest's RAM instead of
+        # memory Unicorn owns, so that a second engine can share it - the
+        # flat machine runs a program's real-mode driver on a 16-bit core
+        # over the same bytes.
         self.uc = Uc(UC_ARCH_X86, cpu_mode)
-        self.uc.mem_map(0, MEM_SIZE if mem_size is None else mem_size)
+        size = MEM_SIZE if mem_size is None else mem_size
+        if mem_buf is None:
+            self.uc.mem_map(0, size)
+        else:
+            self.uc.mem_map_ptr(0, size, UC_PROT_ALL, mem_buf)
         self._load(exe_path, blaster)
         self.uc.hook_add(UC_HOOK_INTR, self._on_intr)
         self.uc.hook_add(UC_HOOK_INSN, self._on_in, None, 1, 0, UC_X86_INS_IN)
@@ -1232,6 +1240,15 @@ class DosMachine:
             self.finished = f"instruction budget ({self.max_insns}) exhausted"
         return self.finished
 
+    def service_deferred(self):
+        """Work a hook could not do in place, done between slices.
+
+        Nothing here. The flat-mode machine uses it for a program's
+        real-mode calls: they must run outside the interrupt hook that asked
+        for them, because delivering an interrupt to the program's own
+        handler in the middle of one means re-entering the 32-bit core.
+        """
+
     def shutdown(self):
         """Called once by main() when the run is over. Nothing to do here.
 
@@ -1498,7 +1515,7 @@ class VgaDos(DosMachine):
     fs_note = "host filesystem READ-ONLY; writes intercepted in memory"
 
     def __init__(self, exe, blaster=False, vsync_hz=60.0, hsync_hz=None,
-                 rgbi=False, **kw):
+                 rgbi=False, sb_irq=5, sb_dma=1, sb_version=(2, 1), **kw):
         # The vertical retrace rate the guest sees on port 0x3da. 60 Hz is a
         # CGA, which is what Popcorn was written for and paces on. A VGA
         # refreshes its 200-line modes at 70 Hz, and a game that paces on the
@@ -1636,7 +1653,14 @@ class VgaDos(DosMachine):
         self.cursor = [(0, 0)] * 8
         self.active_page = 0
         self._trun = None
-        self.sb = SoundBlaster(base=0x220, irq=5, dma=1,
+        # IRQ 5 and DMA 1 are the card's factory jumpers and what the
+        # BLASTER string in the environment says; a game that reads its own
+        # configuration file - Destruction Derby's DIG.INI asks for IRQ 7 -
+        # needs the card to match it.
+        # The DSP version decides which driver accepts the card: an SB Pro
+        # driver wants 3.x and uninstalls itself on a 2.x answer.
+        self.sb = SoundBlaster(base=0x220, irq=sb_irq, dma=sb_dma,
+                              version=sb_version,
                               log=print, verbose=True) if blaster else None
         self.sb_last_tick = None
         self.sb_irqs = 0
@@ -2043,12 +2067,12 @@ class VgaDos(DosMachine):
         if not self.sb.irq_enabled():
             return
         # Only deliver when the guest has interrupts enabled and has installed a
-        # handler; IRQ5 is INT 0dh on the master PIC.
+        # handler; IRQ n on the master PIC is INT 08h+n.
         if not (self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200):
             return
-        if self._dispatch_to_guest(0x0D):
+        if self._dispatch_to_guest(0x08 + self.sb.irq):
             self.sb_irqs += 1
-            self.sb.irq_pending = False
+            self.sb.deliver()
 
     # ------------------------------------------------------------- input
     def guest_owns_keyboard(self):
@@ -3396,6 +3420,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
                     running = False
                     break
                 addr = m.pc()
+                m.service_deferred()
                 m.service_sound()
                 m.service_keyboard()
                 m.service_timer()
@@ -3681,7 +3706,7 @@ def main(argv=None, *, make_machine=None, add_arguments=None):
               f"at exit")
     if m.sb is not None:
         print(f"  sound blaster   : {json.dumps(m.sb.summary(), indent=2)}")
-        print(f"  IRQ5 delivered  : {m.sb_irqs}")
+        print(f"  SB IRQ delivered: {m.sb_irqs}")
         path = m.sb.write_wav((args.wav or os.path.splitext(os.path.basename(args.program))[0] + '.wav'))
         print(f"  audio written   : {path or 'nothing - no PCM produced'}")
     print(f"  files read      : {m.files_read}")

@@ -123,6 +123,14 @@ class SoundBlaster:
         # IRQ / PIC
         self.irq_pending = False
         self.pic_mask = 0xFF           # everything masked until the game says so
+        # The rest of the master PIC a driver looks at: which request is in
+        # service, and which register a read of port 0x20 answers with.
+        # Destruction Derby's SB Pro driver enters its IRQ 7 handler and asks
+        # the in-service register whether IRQ 7 really is - the classic
+        # spurious-IRQ-7 check - and with 0 answered it took every real
+        # interrupt for a phantom and failed its own card test eight times.
+        self.in_service = 0
+        self.pic_read = "irr"          # OCW3 selects "irr" or "isr"
 
         # Output
         self.pcm = bytearray()
@@ -156,6 +164,19 @@ class SoundBlaster:
         if port in (0x20, 0x21):
             if port == 0x21:
                 self.pic_mask = v
+            elif v & 0x18 == 0x08:                  # OCW3
+                if v & 0x03 == 0x02:
+                    self.pic_read = "irr"
+                elif v & 0x03 == 0x03:
+                    self.pic_read = "isr"
+            elif v & 0x18 == 0x00:                  # OCW2
+                if v & 0xE0 == 0x20:                # non-specific EOI
+                    for bit in range(8):
+                        if self.in_service & (1 << bit):
+                            self.in_service &= ~(1 << bit)
+                            break
+                elif v & 0xE0 == 0x60:              # specific EOI
+                    self.in_service &= ~(1 << (v & 7))
             return True
         return self._dma_write(port, v)
 
@@ -164,7 +185,16 @@ class SoundBlaster:
             return self._dsp_read(port - self.base)
         if port == 0x21:
             return self.pic_mask
+        if port == 0x20:
+            if self.pic_read == "isr":
+                return self.in_service
+            return (1 << self.irq) if self.irq_pending else 0
         return self._dma_read(port)
+
+    def deliver(self):
+        """The CPU has taken our interrupt: it is in service until the EOI."""
+        self.irq_pending = False
+        self.in_service |= 1 << self.irq
 
     def _dma_read(self, port):
         """Current address / current count read-back for our DMA channel.
