@@ -294,6 +294,146 @@ where one is real. Of the eight this found, four were that; three factor the
 call through another transcribed routine, which the scan cannot see; one was
 genuinely gone.
 
+## A field's meaning is a measurement, not a reading — **break on it**
+
+**This is the rule most easily skipped and the one that costs most.** A field's
+name, the comment above it and the shape of the code around it are all somebody
+else's earlier reading, and a wrong one propagates: it gets a type, the type
+gets asserted, and the assertion then defends the mistake.
+
+**When you are not sure what a field holds, stop and look at the value.**
+
+In the port, with the developer build:
+
+```sh
+TIM_HEADLESS=1 TIM_GAMEDIR=<game> TIM_STOPFLIP=600 \
+  gdb -q -batch -ex "b routine" -ex run -ex "p STRUCT.field" reconstruct/devtim
+```
+
+In **the original**, under the hybrid, which is the answer that settles an
+argument about what the game does:
+
+```sh
+TIM_LUA=8731 tools/native/native &          # the scripting listener
+tim.bp(0x29cb5)        -- a breakpoint in the original's own code
+tim.peek16(0x4a8e)     -- a DGROUP word, as the original left it
+tim.bps()              -- what each breakpoint saw
+```
+
+Worked example. A pair of words was typed `struct far_ptr` and commented "the
+timer callback; its segment is a relocation". The listing showed the store
+taking a *return value*, and the two words read **1 and 2** — the first and
+second timer slots, not the `193e`/`2619` a function pointer would have shown.
+Two independent handles wearing a pointer's type and a pointer's name.
+
+**The same run tells you whether a check covers the code at all.** With
+`-ex "ignore N 1000000"` and `-ex "info breakpoints"`, gdb counts executions:
+`alloc_shape` runs 4,253 times in an intro the verifier reports as
+"TRANSCRIBED, NEVER CALLED on these screens" — that verdict is about the
+*emulated original's* coverage, not the port's. Measure before claiming either.
+
+## Converting pointers: two passes, and the names that keep them apart
+
+**Do it in two passes, never one.**
+
+1. **Every pair becomes a `struct far_ptr` first**, including the ones split
+   across two `int16_t` fields. The layout stays byte-identical, so a
+   difference at this stage is a mistake rather than a design choice.
+2. **Then lift.** Parameters, returns and locals become host pointers; the
+   pair survives only where the guest *stores* one.
+
+**Keep the stored types — `dg_near_t`, `struct far_ptr` — for exactly one
+reason: that memory is compared with the original's.** DGROUP and the records
+in it are read back byte for byte against the emulated original, so a value
+written there has to be the two words the original wrote, in its order, with
+its segment. Nothing else forces the shape. A pointer that is only followed
+never goes near that comparison, so it has no reason to be anything but a host
+pointer — and a stored field that turns out *not* to be compared (a handle, a
+counter) has no reason to keep the pair type at all.
+
+**Convert at the moment the pair is read out — including into a function's
+parameters.** A routine that takes `uint16_t es, uint16_t bx` and does `MK_FP`
+in its body is still writing 16-bit assembly in C: make the parameter the
+pointer and let the caller convert. The same for a local: build the pointer
+where the pair is loaded, not at each use.
+
+**Name the two directions symmetrically**, or every call site has to be read
+twice:
+
+| | file a pointer | read one back |
+| --- | --- | --- |
+| near (an offset into the data segment) | `dg_near(base, p)` | `dg_near_ptr(off)` |
+| far (a `seg:off` pair) | `dg_far(base, p)`, `far_of(p)` | `dg_far_ptr(fp)` |
+
+Two more earn their names: **`far_stepped(from, p)`** files the pair the
+original files when it steps an offset inside a segment it already has —
+`far_of` would renormalise and change the stored words — and a **typed
+`X_PTR(fp)`** per record reads better than a cast at each use.
+
+**Do not invent a helper for stepping.** `dg_far_ptr_step(p, n)` looks
+symmetrical and is a wrapper around arithmetic: do the arithmetic outside, and
+when something is *stepped*, give it a type that steps properly — a
+`uint16_t *` for a word table, a `struct entry *` for a record — so `cur++` and
+`table[i]` say what `+= 6` and `*(uint16_t *)(p + 2 * i)` did not.
+
+### Split pairs, in both directions
+
+- **Two `int16_t` fields used as a segment and an offset are one far pointer.**
+  Worth a rule in the shape tool: it must follow locals, copies between frame
+  slots, and an `off + N`, because the halves are usually loaded into two
+  variables first — of four found by hand in one codebase, exactly one was
+  written as a direct argument. A file-local macro over `MK_FP` hides the
+  shape from a tool that reads the parse tree.
+- **The reverse has no tool.** A `struct far_ptr` whose halves are two
+  unrelated values — two timer handles, two counters — is found only by asking
+  what the code does with each half. See the breakpoint rule above.
+
+### A record read by offset is a struct, and the evidence fixes it
+
+The **size** comes from the allocation (`dos_alloc_bytes(0x18, ...)`), the
+**count** from what fits (192 patches of 28 bytes end exactly where the next
+named thing starts), and both go into a `_Static_assert` with a per-field
+offset assert. Name a field for **what the code does with it**: a table
+described as "the channel each slot is on" turned out to be the register
+offset the slot's operator answers to, and a byte named for a life count was a
+count of how many passes a record waits before being put back — this game has
+no lives.
+
+### Mistakes a mechanical rewrite makes
+
+- A search-and-replace that introduces a helper **rewrites the helper's own
+  body** into a call to itself. Exclude the definition, and read the diff of
+  the header before building.
+- A cast that belonged to one *half* survives on the whole struct:
+  `MK_FP((uint16_t)X.seg, (uint16_t)X.off)` becomes `f((uint16_t)X)`.
+- Inserting a block above a routine **separates it from its provenance
+  comment**, and only the comment directly above counts. The provenance check
+  catches it; run it before believing the batch.
+- Splitting one change into two commits after the fact is harder than staging
+  them apart: `git add -A` sweeps in the second change and the message then
+  lies about what was verified.
+
+### What a pointer change owes as evidence
+
+- When the change is a **pure spelling**, compare the compiled object —
+  `objdump -d` of the one file, before and after. Identical code is a stronger
+  answer than any behavioural run and takes a minute.
+- When the verifier never reaches the code, **A/B the port against the previous
+  build** on a scenario that does — and prove it does, with a breakpoint count,
+  before trusting the result.
+- **Check the check's own determinism first.** Comparing rendered FM audio
+  across builds is worthless if the same binary answers 1423888, 1422864 and
+  1421840 bytes on three runs; run old-against-old before old-against-new.
+  Know the noise bands in the frame stream for the same reason.
+- Say in the commit which routines were verified and over how many calls, and
+  say plainly when something rests on reading rather than on execution.
+
+**Write all of this into the project's `CLAUDE.md`** as the conventions go in —
+the two passes, the two directions of naming, the breakpoint rule, and the
+record-is-a-struct rule. They are the ones that decay first, because each
+looks like tidiness until the day a wrong field type or an unmeasured guess
+costs a day.
+
 ## The order of work
 
 **1. Find out what is already known, before starting.**
